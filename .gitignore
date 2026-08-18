@@ -8,9 +8,9 @@ build/
 runs/*
 !runs/.gitkeep
 reports/generated/*
+!reports/generated/.gitkeep
 external_results/baseline_manifest.json
 data/
 *.pth
 *.pt
 *.npz
-
