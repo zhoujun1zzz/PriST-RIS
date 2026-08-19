@@ -1,8 +1,8 @@
 # V3.1 Quasi-to-Mobility spatial transfer
 
-Quasi provides spatial pretraining only; PriST-RIS does not claim that future forecasting was pretrained on Quasi.
+Quasi provides spatial pretraining only; PriST-RIS does not claim that Mobility non-pilot reconstruction was pretrained on Quasi.
 
-The explicit spatial-only loader accepts a V3.1 Quasi C/Full checkpoint and loads compatible backbone, coordinate encoders, prior feature encoder, shared anchor feature layer, and first anchor head. The Mobility second anchor head, temporal spatial encoder/bases, coefficient/trend module, and future correction remain newly initialized. Metadata records loaded, skipped, and newly initialized keys.
+The explicit spatial-only loader accepts a V3.1 Quasi C/Full checkpoint and loads compatible backbone, coordinate encoders, prior feature encoder, shared anchor feature layer, and first anchor head. The Mobility q3 anchor head, temporal spatial encoder/bases, coefficient/trend module, and non-pilot correction remain newly initialized. Metadata records loaded, skipped, and newly initialized keys.
 
 Fractions are nested 1%, 5%, 10%, 20%, and 100% subsets. Canonical protocols are:
 

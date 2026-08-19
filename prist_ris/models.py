@@ -10,6 +10,8 @@ from torch.nn import functional as F
 from .contracts import (
     ANTENNAS,
     ARCHITECTURE_VERSION,
+    DataSemantics,
+    MOBILITY_CONTRACT_VERSION,
     MODEL_DISPLAY_NAME,
     OBSERVED_RIS_INDICES,
     canonical_model_key,
@@ -264,17 +266,31 @@ class TrendConditionedTemporal(nn.Module):
         self.alpha_head = nn.Linear(2 * hidden, 1)
         self.last_delta_norm: float | None = None
         self.last_complex_dtype: torch.dtype | None = None
+        self.last_missing_time_index: tuple[int, ...] | None = None
+        self.last_base_alpha: torch.Tensor | None = None
 
-    def forward(self, anchors: torch.Tensor, query_time: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        anchors: torch.Tensor,
+        query_time: torch.Tensor,
+        anchor_time_index: tuple[int, int],
+    ) -> torch.Tensor:
         if anchors.shape[1:] != (2, 256, ANTENNAS, 2):
-            raise ValueError("Mobility temporal input must contain A0/A1 dual anchors.")
-        future_time = query_time[2:]
-        if future_time.numel() != 4:
-            raise ValueError("Mobility future queries must be q2..q5.")
-        a0, a1 = anchors[:, 0], anchors[:, 1]
-        delta = a1 - a0 if self.use_delta else torch.zeros_like(a1)
+            raise ValueError("Mobility temporal input must contain A0/A3 dual anchors.")
+        query_values = tuple(int(value) for value in query_time.detach().cpu().tolist())
+        missing_time_index = tuple(
+            value for value in query_values if value not in anchor_time_index
+        )
+        if missing_time_index != (1, 2, 4, 5):
+            raise ValueError("Mobility non-pilot queries must be q1,q2,q4,q5.")
+        missing_time = torch.tensor(
+            missing_time_index, device=anchors.device, dtype=anchors.dtype
+        )
+        a0, a3 = anchors[:, 0], anchors[:, 1]
+        delta = a3 - a0 if self.use_delta else torch.zeros_like(a3)
         self.last_delta_norm = float(delta.detach().norm())
-        temporal_input = torch.cat((a0, a1, delta), dim=-1)
+        self.last_missing_time_index = missing_time_index
+        temporal_input = torch.cat((a0, a3, delta), dim=-1)
         temporal_grid = temporal_input.reshape(anchors.shape[0], 256, ANTENNAS, 6)
         temporal_grid = temporal_grid.reshape(anchors.shape[0], 16, 16, ANTENNAS, 6)
         temporal_grid = temporal_grid.permute(0, 4, 3, 1, 2).contiguous()
@@ -282,10 +298,13 @@ class TrendConditionedTemporal(nn.Module):
         raw_bases = self.basis_head(features)
         bases = raw_bases.reshape(anchors.shape[0], self.rank, 2, ANTENNAS, 256)
         bases = bases.permute(0, 1, 4, 3, 2).contiguous()
-        pooled = (a0.mean(dim=(1, 2)), a1.mean(dim=(1, 2)), delta.mean(dim=(1, 2)))
+        pooled = (a0.mean(dim=(1, 2)), a3.mean(dim=(1, 2)), delta.mean(dim=(1, 2)))
         contexts = [self.anchor_context(value) for value in pooled]
-        time = future_time.to(anchors).reshape(-1, 1) / 5.0
-        time_context = self.time_encoder(time)
+        base_alpha = normalized_time_coordinates(
+            missing_time, anchor_time_index
+        ).reshape(1, 4, 1, 1, 1)
+        self.last_base_alpha = base_alpha.detach().cpu()
+        time_context = self.time_encoder(base_alpha.reshape(-1, 1))
         fused = []
         for position in range(4):
             fused.append(
@@ -307,11 +326,20 @@ class TrendConditionedTemporal(nn.Module):
         )
         residual = complex_factorized_reconstruction(bases, coefficients)
         self.last_complex_dtype = torch.complex64
-        base_alpha = (future_time.to(anchors) - 1.0).reshape(1, 4, 1, 1, 1)
         learned_alpha = 0.25 * torch.tanh(self.alpha_head(fused_context)).reshape(
             anchors.shape[0], 4, 1, 1, 1
         )
-        return a1.unsqueeze(1) + (base_alpha + learned_alpha) * delta.unsqueeze(1) + residual
+        return a0.unsqueeze(1) + (base_alpha + learned_alpha) * delta.unsqueeze(1) + residual
+
+
+def normalized_time_coordinates(
+    query_time: torch.Tensor, anchor_time_index: tuple[int, int]
+) -> torch.Tensor:
+    """Normalize semantic query times by the actual pilot spacing."""
+    t0, t1 = anchor_time_index
+    if t1 <= t0:
+        raise ValueError("anchor_time_index must contain two increasing times.")
+    return (query_time - float(t0)) / float(t1 - t0)
 
 
 class FutureResidualCorrection(nn.Module):
@@ -323,14 +351,14 @@ class FutureResidualCorrection(nn.Module):
         )
         self.output = nn.Conv3d(hidden, 2, 3, padding=1)
 
-    def forward(self, future: torch.Tensor) -> torch.Tensor:
-        if future.shape[1:] != (4, 256, ANTENNAS, 2):
-            raise ValueError("Temporal correction only accepts q2..q5.")
-        b = future.shape[0]
-        grid = future.reshape(b * 4, 16, 16, ANTENNAS, 2).permute(0, 4, 3, 1, 2)
+    def forward(self, non_pilot: torch.Tensor) -> torch.Tensor:
+        if non_pilot.shape[1:] != (4, 256, ANTENNAS, 2):
+            raise ValueError("Temporal correction only accepts q1,q2,q4,q5.")
+        b = non_pilot.shape[0]
+        grid = non_pilot.reshape(b * 4, 16, 16, ANTENNAS, 2).permute(0, 4, 3, 1, 2)
         correction = self.output(self.blocks(F.gelu(self.input(grid))))
         correction = correction.permute(0, 3, 4, 2, 1).reshape(b, 4, 256, ANTENNAS, 2)
-        return future + correction
+        return non_pilot + correction
 
 
 @dataclass(frozen=True)
@@ -366,6 +394,13 @@ class PriSTRIS(nn.Module):
             **{**asdict(config), "model_key": key, "coordinate_enabled": coordinate_enabled}
         )
         self.anchor_count = 1 if config.domain == "quasi" else 2
+        semantics = DataSemantics.for_domain(config.domain)
+        self.spatial_anchor_time_index = semantics.obs_time_index
+        self.output_time_index = (
+            semantics.query_time
+            if key == "prist_ris_full" and config.domain == "mobility"
+            else semantics.obs_time_index
+        )
         self.uses_prior = key in {"prist_ris_b", "prist_ris_c", "prist_ris_full"}
         self.backbone = PhysicalGridBackbone(
             config.hidden,
@@ -425,25 +460,48 @@ class PriSTRIS(nn.Module):
         anchors = self.spatial_anchors(batch, prior)
         if self.config.domain == "quasi" or self.config.model_key != "prist_ris_full":
             return anchors
+        query_time = batch["query_time"][0] if batch["query_time"].ndim > 1 else batch["query_time"]
         if self.config.temporal_mode == "static":
-            future = anchors[:, 1:2].expand(-1, 4, -1, -1, -1)
+            non_pilot = anchors[:, 1:2].expand(-1, 4, -1, -1, -1)
         else:
-            query_time = batch["query_time"][0] if batch["query_time"].ndim > 1 else batch["query_time"]
-            future = self.temporal(anchors, query_time)  # type: ignore[operator]
+            non_pilot = self.temporal(  # type: ignore[operator]
+                anchors,
+                query_time,
+                tuple(self.spatial_anchor_time_index),
+            )
         if self.temporal_correction is not None:
-            future = self.temporal_correction(future)
-        return torch.cat((anchors, future), dim=1)
+            non_pilot = self.temporal_correction(non_pilot)
+        query_values = tuple(int(value) for value in query_time.detach().cpu().tolist())
+        non_pilot_time_index = tuple(
+            value for value in query_values if value not in self.spatial_anchor_time_index
+        )
+        positions = {value: position for position, value in enumerate(query_values)}
+        output = anchors.new_empty(
+            anchors.shape[0], len(query_values), *anchors.shape[2:]
+        )
+        for anchor_position, semantic_time in enumerate(self.spatial_anchor_time_index):
+            output[:, positions[semantic_time]] = anchors[:, anchor_position]
+        for compact_position, semantic_time in enumerate(non_pilot_time_index):
+            output[:, positions[semantic_time]] = non_pilot[:, compact_position]
+        return output
 
     def protocol_metadata(self) -> dict[str, object]:
         return {
             "method": MODEL_DISPLAY_NAME,
             "architecture_version": ARCHITECTURE_VERSION,
+            "mobility_contract_version": (
+                MOBILITY_CONTRACT_VERSION
+                if self.config.domain == "mobility"
+                else None
+            ),
             "canonical_model_key": self.config.model_key,
             "physical_grid": True,
             "physical_ris_shapes": ["16x2", "16x4", "16x8", "16x16"],
             "strong_spatio_ris_conv3d": True,
             "prior_guided": self.uses_prior,
             "prior_anchors": self.anchor_count if self.uses_prior else 0,
+            "spatial_anchor_time_index": list(self.spatial_anchor_time_index),
+            "output_time_index": list(self.output_time_index),
             "coordinate_enabled": self.config.coordinate_enabled,
             "antenna_encoding_semantics": "antenna_index_encoding",
             "cross_attention_layers": 0,
@@ -453,7 +511,10 @@ class PriSTRIS(nn.Module):
                 else None
             ),
             "temporal_rank": self.config.temporal_rank if self.temporal is not None else None,
-            "future_target_inputs": False,
+            "temporal_prediction_scope": (
+                "non_pilot_q1_q2_q4_q5" if self.temporal is not None else None
+            ),
+            "target_h_forward_inputs": False,
             "observation_mask_used": False,
         }
 
@@ -491,12 +552,17 @@ def canonical_batch(
     domain: str, batch_size: int = 1, device: torch.device | None = None
 ) -> dict[str, torch.Tensor]:
     device = device or torch.device("cpu")
-    times, queries = ((1, 1) if domain == "quasi" else (2, 6))
+    semantics = DataSemantics.for_domain(domain)
+    times, queries = len(semantics.obs_time_index), len(semantics.query_time)
     return {
         "obs_h": torch.zeros(batch_size, times, 32, ANTENNAS, 2, device=device),
         "target_h": torch.zeros(batch_size, queries, 256, ANTENNAS, 2, device=device),
         "obs_ris_index": torch.tensor(OBSERVED_RIS_INDICES, device=device).expand(batch_size, -1),
-        "obs_time_index": torch.arange(times, device=device).expand(batch_size, -1),
-        "query_time": torch.arange(queries, device=device).expand(batch_size, -1),
+        "obs_time_index": torch.tensor(
+            semantics.obs_time_index, device=device
+        ).expand(batch_size, -1),
+        "query_time": torch.tensor(
+            semantics.query_time, device=device
+        ).expand(batch_size, -1),
         "sample_index": torch.arange(batch_size, device=device),
     }

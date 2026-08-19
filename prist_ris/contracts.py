@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass
 
 MODEL_DISPLAY_NAME = "PriST-RIS"
 ARCHITECTURE_VERSION = "3.1"
+MOBILITY_CONTRACT_VERSION = "mobility_q0_q3_v1"
 MODEL_KEYS = (
     "prist_ris_a",
     "prist_ris_b",
@@ -20,6 +21,9 @@ GRID_HEIGHT = GRID_WIDTH = 16
 ANTENNAS = 64
 COMPLEX_LAYOUT = "grouped"
 METRIC_CONTRACT = "sample_mean_linear_then_db"
+MOBILITY_ANCHOR_TIME_INDEX = (0, 3)
+MOBILITY_QUERY_TIME_INDEX = (0, 1, 2, 3, 4, 5)
+MOBILITY_NON_PILOT_TIME_INDEX = (1, 2, 4, 5)
 
 
 def canonical_model_key(key: str) -> str:
@@ -60,8 +64,8 @@ class DataSemantics:
                 input_shape=("B", 2, 32, 64, 2),
                 target_shape=("B", 6, 256, 64, 2),
                 obs_ris_index=OBSERVED_RIS_INDICES,
-                obs_time_index=(0, 1),
-                query_time=(0, 1, 2, 3, 4, 5),
+                obs_time_index=MOBILITY_ANCHOR_TIME_INDEX,
+                query_time=MOBILITY_QUERY_TIME_INDEX,
             )
         raise ValueError("domain must be 'quasi' or 'mobility'.")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -9,6 +10,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from prist_ris.cli import parser
 from prist_ris.contracts import DataSemantics
+from prist_ris.engine import TrainingConfig, train
+from prist_ris.models import canonical_batch
 from prist_ris.prior import RidgePrior, RidgeStatistics
 
 
@@ -21,9 +24,9 @@ def _mobility_batch(samples: int = 2) -> dict[str, torch.Tensor]:
 
 
 def test_mobility_prior_outputs_two_anchors_and_round_trips(tmp_path: Path) -> None:
-    statistics = RidgeStatistics.accumulate([_mobility_batch()], (0, 1))
+    statistics = RidgeStatistics.accumulate([_mobility_batch()], (0, 3))
     prior = statistics.solve(1e-3, DataSemantics.for_domain("mobility"))
-    assert prior.target_blocks == (0, 1)
+    assert prior.target_blocks == (0, 3)
     assert prior.predict(_mobility_batch()).shape == (2, 2, 256, 64, 2)
     path = tmp_path / "dual_ridge.npz"
     metadata = prior.save(path)
@@ -51,4 +54,39 @@ def test_ridge_rejects_non_train_loader() -> None:
             return {key: value[0] for key, value in _mobility_batch().items()}
 
     with pytest.raises(PermissionError):
-        RidgeStatistics.accumulate(DataLoader(ValidationDataset(), batch_size=1), (0, 1))
+        RidgeStatistics.accumulate(DataLoader(ValidationDataset(), batch_size=1), (0, 3))
+
+
+def test_prefix_q0_q1_mobility_prior_is_rejected(tmp_path: Path) -> None:
+    current = DataSemantics.for_domain("mobility")
+    old = replace(current, obs_time_index=(0, 1))
+    assert old.stable_hash() != current.stable_hash()
+    coefficients = np.zeros((64, 2 * 256), dtype=np.complex128)
+    prior = RidgePrior(
+        coefficients=coefficients,
+        regularization=1e-3,
+        rows=1,
+        target_blocks=(0, 1),
+        semantics_hash=old.stable_hash(),
+    )
+    path = tmp_path / "prefix_prior.npz"
+    prior.save(path)
+    config = TrainingConfig(
+        domain="mobility",
+        model_key="prist_ris_b",
+        mode="smoke",
+        hidden=2,
+        blocks_per_stage=(1, 1, 1),
+        final_refine_blocks=1,
+        epochs=1,
+    )
+    batch = canonical_batch("mobility")
+    with pytest.raises(ValueError, match="semantics do not match"):
+        train(
+            config,
+            [batch],
+            [batch],
+            run_dir=tmp_path / "rejected_run",
+            device=torch.device("cpu"),
+            prior_path=path,
+        )

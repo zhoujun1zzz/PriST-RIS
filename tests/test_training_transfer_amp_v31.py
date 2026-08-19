@@ -7,12 +7,19 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from prist_ris.checkpoint import load_checkpoint
-from prist_ris.contracts import ARCHITECTURE_VERSION, OBSERVED_RIS_INDICES
+from prist_ris.contracts import (
+    ARCHITECTURE_VERSION,
+    OBSERVED_RIS_INDICES,
+    DataSemantics,
+)
 from prist_ris.engine import (
     TrainingConfig,
+    _select,
     _require_architecture_version,
     configure_adaptation,
     load_spatial_pretrained,
+    require_checkpoint_contract,
+    restore_loader_generator_state,
     train,
 )
 from prist_ris.experiments import (
@@ -180,8 +187,55 @@ def test_transfer_protocols_have_no_fake_adapter_and_distinct_sets() -> None:
 
 
 def test_ablation_scopes_are_not_mixed() -> None:
-    assert SPATIAL_ABLATION_TARGET_BLOCKS == (0, 1)
+    assert SPATIAL_ABLATION_TARGET_BLOCKS == (0, 3)
     assert TEMPORAL_ABLATION_TARGET_BLOCKS == (0, 1, 2, 3, 4, 5)
+
+
+@pytest.mark.parametrize("blocks", [(0, 3), (0,), (3,)])
+def test_compact_spatial_predictions_align_by_semantic_time(
+    blocks: tuple[int, ...],
+) -> None:
+    prediction = torch.tensor([[[10.0], [30.0]]])
+    target = torch.arange(6.0).reshape(1, 6, 1)
+    selected_prediction, selected_target, selected_times = _select(
+        prediction, target, blocks, (0, 3)
+    )
+    assert selected_times == blocks
+    expected = torch.tensor(
+        [[[10.0 if value == 0 else 30.0]] for value in blocks]
+    ).reshape(1, len(blocks), 1)
+    torch.testing.assert_close(selected_prediction, expected)
+    torch.testing.assert_close(
+        selected_target, torch.tensor(blocks, dtype=torch.float32).reshape(1, -1, 1)
+    )
+
+
+def test_prefix_mobility_checkpoint_is_rejected_by_contract_guard() -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    old_state = {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "model_config": {"domain": "mobility"},
+        "semantics_hash": semantics.stable_hash(),
+        "data_semantics": semantics.to_dict(),
+    }
+    with pytest.raises(ValueError, match="pre-fix Mobility"):
+        require_checkpoint_contract(old_state, "Resume", expected_domain="mobility")
+
+
+def test_loader_generator_state_is_normalized_to_cpu_uint8() -> None:
+    source = torch.Generator().manual_seed(987)
+    restored = torch.Generator()
+    state = source.get_state().to(torch.int16).contiguous()
+    restore_loader_generator_state(restored, state)
+    torch.testing.assert_close(restored.get_state(), source.get_state())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_loader_generator_state_mapped_to_cuda_is_restored() -> None:
+    source = torch.Generator().manual_seed(654)
+    restored = torch.Generator()
+    restore_loader_generator_state(restored, source.get_state().cuda())
+    torch.testing.assert_close(restored.get_state(), source.get_state())
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

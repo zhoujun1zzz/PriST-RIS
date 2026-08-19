@@ -10,6 +10,7 @@ from prist_ris.models import (
     build_model,
     canonical_batch,
     complex_factorized_reconstruction,
+    normalized_time_coordinates,
     observations_to_physical_grid,
     physical_grid_to_observations,
 )
@@ -97,7 +98,7 @@ def test_canonical_ladder_and_dual_spatial_outputs() -> None:
     assert full.config.architecture_version == ARCHITECTURE_VERSION
 
 
-def test_full_q0_q1_equal_spatial_anchors() -> None:
+def test_full_q0_q3_equal_spatial_anchors() -> None:
     torch.manual_seed(5)
     model = build_model("prist_ris_full", domain="mobility", **SMALL)
     batch = canonical_batch("mobility")
@@ -105,7 +106,10 @@ def test_full_q0_q1_equal_spatial_anchors() -> None:
     prior = torch.randn(1, 2, 256, 64, 2)
     anchors = model.spatial_anchors(batch, prior)
     output = model(batch, prior)
-    torch.testing.assert_close(output[:, :2], anchors)
+    torch.testing.assert_close(output[:, 0], anchors[:, 0])
+    torch.testing.assert_close(output[:, 3], anchors[:, 1])
+    assert model.spatial_anchor_time_index == (0, 3)
+    assert model.output_time_index == (0, 1, 2, 3, 4, 5)
 
 
 def test_future_prediction_uses_no_target_and_receives_delta() -> None:
@@ -120,6 +124,7 @@ def test_future_prediction_uses_no_target_and_receives_delta() -> None:
     torch.testing.assert_close(first, second)
     assert model.temporal is not None and model.temporal.last_delta_norm is not None
     assert model.temporal.last_delta_norm > 0
+    assert model.temporal.last_missing_time_index == (1, 2, 4, 5)
 
 
 def test_rank_2_and_3_shapes() -> None:
@@ -132,7 +137,7 @@ def test_rank_2_and_3_shapes() -> None:
         assert model(batch, prior).shape == (1, 6, 256, 64, 2)
 
 
-def test_temporal_residual_only_changes_q2_to_q5() -> None:
+def test_temporal_residual_only_changes_non_pilot_queries() -> None:
     torch.manual_seed(12)
     corrected = build_model("prist_ris_full", domain="mobility", **SMALL)
     plain = build_model(
@@ -149,8 +154,45 @@ def test_temporal_residual_only_changes_q2_to_q5() -> None:
     prior = torch.randn(1, 2, 256, 64, 2)
     with_correction = corrected(batch, prior)
     without_correction = plain(batch, prior)
-    torch.testing.assert_close(with_correction[:, :2], without_correction[:, :2])
-    assert not torch.equal(with_correction[:, 2:], without_correction[:, 2:])
+    torch.testing.assert_close(with_correction[:, (0, 3)], without_correction[:, (0, 3)])
+    assert not torch.equal(
+        with_correction[:, (1, 2, 4, 5)],
+        without_correction[:, (1, 2, 4, 5)],
+    )
+
+
+def test_temporal_trend_uses_actual_three_block_pilot_spacing() -> None:
+    query = torch.tensor([1.0, 2.0, 4.0, 5.0])
+    alpha = normalized_time_coordinates(query, (0, 3))
+    torch.testing.assert_close(alpha, torch.tensor([1 / 3, 2 / 3, 4 / 3, 5 / 3]))
+    a0 = torch.tensor(0.0)
+    a3 = torch.tensor(3.0)
+    torch.testing.assert_close(a0 + alpha * (a3 - a0), query)
+
+
+def test_full_scatter_restores_q0_through_q5_order() -> None:
+    model = build_model(
+        "prist_ris_full",
+        domain="mobility",
+        temporal_residual=False,
+        **SMALL,
+    )
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    prior = torch.zeros(1, 2, 256, 64, 2)
+    prior[:, 1] = 3.0
+    output = model(canonical_batch("mobility"), prior)
+    expected = torch.arange(6.0).reshape(1, 6, 1, 1, 1).expand_as(output)
+    torch.testing.assert_close(output, expected)
+
+
+def test_spatial_model_metadata_declares_compact_q0_q3_outputs() -> None:
+    for key in ("prist_ris_a", "prist_ris_b", "prist_ris_c"):
+        model = build_model(key, domain="mobility", **SMALL)
+        metadata = model.protocol_metadata()
+        assert metadata["spatial_anchor_time_index"] == [0, 3]
+        assert metadata["output_time_index"] == [0, 3]
 
 
 def test_complex_factorization_is_float32_island() -> None:

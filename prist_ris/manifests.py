@@ -8,7 +8,13 @@ from typing import Any
 
 import torch
 
-from .contracts import ARCHITECTURE_VERSION, DataSemantics, METRIC_CONTRACT
+from .contracts import (
+    ARCHITECTURE_VERSION,
+    MOBILITY_CONTRACT_VERSION,
+    DataSemantics,
+    METRIC_CONTRACT,
+)
+from .engine import require_checkpoint_contract
 
 
 METHOD_NAMES = {
@@ -153,8 +159,11 @@ def freeze_experiment(
                 raise FileNotFoundError(f"Cannot freeze missing {kind}: {resolved}")
             if kind == "checkpoint":
                 state = torch.load(resolved, map_location="cpu", weights_only=False)
-                if state.get("architecture_version") != ARCHITECTURE_VERSION:
-                    raise ValueError("Freeze requires PriST-RIS V3.1 checkpoints only.")
+                config = state.get("model_config")
+                domain = config.get("domain") if isinstance(config, dict) else None
+                require_checkpoint_contract(
+                    state, "Freeze", expected_domain=str(domain)
+                )
             artifacts.append({"kind": kind, "path": str(resolved), "sha256": sha256(resolved)})
     baseline = None
     if baseline_manifest is not None:
@@ -167,6 +176,7 @@ def freeze_experiment(
         "schema": "prist_ris.frozen_experiment.v1",
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
         "commit": current_commit(project),
         "artifacts": artifacts,
         "baseline_manifest": baseline,
@@ -188,6 +198,7 @@ def validate_test_unlock(freeze_manifest: str | Path, checkpoint: str | Path) ->
     if (
         frozen.get("schema") != "prist_ris.frozen_experiment.v1"
         or frozen.get("architecture_version") != ARCHITECTURE_VERSION
+        or frozen.get("mobility_contract_version") != MOBILITY_CONTRACT_VERSION
         or frozen.get("test_unlocked") is not True
     ):
         raise PermissionError("Independent test is locked until a valid frozen experiment manifest unlocks it.")

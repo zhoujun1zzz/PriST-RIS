@@ -11,6 +11,12 @@ import pytest
 import torch
 
 from prist_ris.cli import _allowed_test
+from prist_ris.contracts import (
+    COMPLEX_LAYOUT,
+    MOBILITY_CONTRACT_VERSION,
+    OBSERVED_RIS_INDICES,
+    DataSemantics,
+)
 from prist_ris.data import (
     DATASET_FILENAMES,
     DatasetSource,
@@ -147,9 +153,10 @@ def test_exact_frozen_checkpoint_hash_gate(tmp_path: Path) -> None:
     manifest = tmp_path / "freeze.json"
     manifest.write_text(
         json.dumps(
-            {
-                "schema": "prist_ris.frozen_experiment.v1",
-                "architecture_version": "3.1",
+                {
+                    "schema": "prist_ris.frozen_experiment.v1",
+                    "architecture_version": "3.1",
+                    "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
                 "test_unlocked": True,
                 "artifacts": [
                     {
@@ -178,9 +185,29 @@ def test_per_query_diagnostics_and_overall_contract() -> None:
     diagnostics.update(prediction, target)
     result = diagnostics.compute()
     assert set(result["per_query"]) == {f"q{index}" for index in range(6)}
-    assert "observed_anchor_aggregate" in result and "future_aggregate" in result
+    assert "observed_anchor_aggregate" in result
+    assert "pilot_anchor_aggregate" in result
+    assert "non_pilot_aggregate" in result
+    assert "future_aggregate" not in result
     overall = MetricAccumulator()
     overall.update(prediction, target)
     assert result["overall"] == overall.compute()
     query_db_mean = sum(value["nmse_db"] for value in result["per_query"].values()) / 6
     assert result["overall"]["nmse_db"] != query_db_mean
+
+
+def test_mobility_q0_q3_data_semantics_contract() -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    assert semantics.obs_time_index == (0, 3)
+    assert semantics.query_time == (0, 1, 2, 3, 4, 5)
+    assert semantics.complex_layout == COMPLEX_LAYOUT == "grouped"
+    assert semantics.obs_ris_index == OBSERVED_RIS_INDICES == tuple(range(0, 256, 8))
+
+
+def test_compact_q0_q3_diagnostics_keep_semantic_labels() -> None:
+    target = torch.ones(1, 2, 1, 1, 2)
+    diagnostics = PerQueryMetricAccumulator((0, 3))
+    diagnostics.update(target.clone(), target)
+    result = diagnostics.compute()
+    assert set(result["per_query"]) == {"q0", "q3"}
+    assert "pilot_anchor_aggregate" in result
