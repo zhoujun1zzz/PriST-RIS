@@ -1,6 +1,6 @@
 # Independent-test isolation
 
-This gate applies unchanged to PriST-RIS V3.1. Freeze additionally rejects checkpoints whose `architecture_version` is not exactly `3.1`.
+This gate applies unchanged to PriST-RIS V3.1. Freeze rejects checkpoints whose `architecture_version` is not exactly `3.1`; Mobility checkpoints must also carry the post-fix `mobility_q0_q3_v1` contract and matching semantics hash.
 
 Test is locked by default at three layers:
 

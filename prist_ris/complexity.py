@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from .models import PriSTRIS, canonical_batch
-from .contracts import ARCHITECTURE_VERSION
+from .contracts import ARCHITECTURE_VERSION, MOBILITY_CONTRACT_VERSION
 
 
 @torch.no_grad()
@@ -66,6 +66,9 @@ def profile_model(
     return {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": (
+            MOBILITY_CONTRACT_VERSION if domain == "mobility" else None
+        ),
         "model_key": model.config.model_key,
         "domain": domain,
         "input_shape": list(batch["obs_h"].shape),
@@ -73,6 +76,8 @@ def profile_model(
         "stage_shapes": [list(shape) for shape in model.last_stage_shapes],
         "coordinate_enabled": model.config.coordinate_enabled,
         "prior_anchors": model.anchor_count if model.uses_prior else 0,
+        "spatial_anchor_time_index": list(model.spatial_anchor_time_index),
+        "output_time_index": list(model.output_time_index),
         "temporal_rank": model.config.temporal_rank if model.temporal is not None else None,
         "parameters": parameters,
         "trainable_parameters": trainable,

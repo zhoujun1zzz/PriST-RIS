@@ -15,7 +15,12 @@ import numpy as np
 import torch
 
 from .checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, save_checkpoint_atomic
-from .contracts import ARCHITECTURE_VERSION, DataSemantics, canonical_model_key
+from .contracts import (
+    ARCHITECTURE_VERSION,
+    MOBILITY_CONTRACT_VERSION,
+    DataSemantics,
+    canonical_model_key,
+)
 from .metrics import MetricAccumulator, PerQueryMetricAccumulator
 from .models import PriSTRIS, build_model
 from .objectives import prist_ris_loss
@@ -94,11 +99,40 @@ def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
     return names
 
 
-def _select(prediction: torch.Tensor, target: torch.Tensor, blocks: tuple[int, ...] | None) -> tuple[torch.Tensor, torch.Tensor]:
-    if blocks is None:
-        return prediction, target
-    index = torch.tensor(blocks, device=prediction.device)
-    return prediction.index_select(1, index), target.index_select(1, index)
+def _select(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    blocks: tuple[int, ...] | None,
+    output_time_index: tuple[int, ...],
+) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+    """Align compact prediction positions with semantic target query times."""
+    if prediction.shape[1] != len(output_time_index):
+        raise ValueError(
+            "Prediction time dimension does not match model output_time_index."
+        )
+    selected_times = output_time_index if blocks is None else tuple(blocks)
+    position_by_time = {
+        semantic_time: position
+        for position, semantic_time in enumerate(output_time_index)
+    }
+    missing = [value for value in selected_times if value not in position_by_time]
+    if missing:
+        raise ValueError(
+            f"Requested target blocks {missing} are absent from model output times "
+            f"{output_time_index}."
+        )
+    if any(value < 0 or value >= target.shape[1] for value in selected_times):
+        raise ValueError("Requested semantic target time is out of range.")
+    prediction_index = torch.tensor(
+        [position_by_time[value] for value in selected_times],
+        device=prediction.device,
+    )
+    target_index = torch.tensor(selected_times, device=target.device)
+    return (
+        prediction.index_select(1, prediction_index),
+        target.index_select(1, target_index),
+        selected_times,
+    )
 
 
 @torch.no_grad()
@@ -117,10 +151,15 @@ def evaluate(
         batch = move_batch(raw, device)
         prior_value = prior.predict(batch) if prior is not None else None
         prediction = model(batch, prior_value)
-        prediction, target = _select(prediction, batch["target_h"], target_blocks)
+        prediction, target, selected_times = _select(
+            prediction,
+            batch["target_h"],
+            target_blocks,
+            tuple(model.output_time_index),
+        )
         metrics.update(prediction, target)
         if diagnostics is None:
-            diagnostics = PerQueryMetricAccumulator(prediction.shape[1])
+            diagnostics = PerQueryMetricAccumulator(selected_times)
         diagnostics.update(prediction, target)
     result: dict[str, object] = dict(metrics.compute())
     if diagnostics is not None:
@@ -136,10 +175,37 @@ def _require_architecture_version(state: dict[str, object], purpose: str) -> Non
         )
 
 
+def require_checkpoint_contract(
+    state: dict[str, object], purpose: str, *, expected_domain: str | None = None
+) -> None:
+    """Reject pre-fix Mobility V3.1 checkpoints while retaining Quasi reuse."""
+    _require_architecture_version(state, purpose)
+    config = state.get("model_config")
+    domain = config.get("domain") if isinstance(config, dict) else None
+    if expected_domain is not None and domain != expected_domain:
+        raise ValueError(
+            f"{purpose} requires domain={expected_domain}; checkpoint has {domain!r}."
+        )
+    if domain != "mobility":
+        return
+    expected = DataSemantics.for_domain("mobility")
+    semantics = state.get("data_semantics")
+    if (
+        state.get("mobility_contract_version") != MOBILITY_CONTRACT_VERSION
+        or state.get("semantics_hash") != expected.stable_hash()
+        or not isinstance(semantics, dict)
+        or semantics.get("obs_time_index") != list(expected.obs_time_index)
+    ):
+        raise ValueError(
+            f"{purpose} rejects pre-fix Mobility V3.1 semantics; expected "
+            f"contract={MOBILITY_CONTRACT_VERSION} and pilots q0/q3."
+        )
+
+
 def load_spatial_pretrained(model: PriSTRIS, state: dict[str, object]) -> dict[str, object]:
     """Load only structurally compatible Quasi spatial weights into Mobility."""
 
-    _require_architecture_version(state, "Spatial transfer")
+    require_checkpoint_contract(state, "Spatial transfer", expected_domain="quasi")
     source_config = state.get("model_config")
     if not isinstance(source_config, dict) or source_config.get("domain") != "quasi":
         raise ValueError("Spatial transfer source must be a Quasi PriST-RIS V3.1 checkpoint.")
@@ -200,6 +266,15 @@ def _loader_generator(loader: Iterable[dict[str, torch.Tensor]]) -> torch.Genera
     return generator if isinstance(generator, torch.Generator) else None
 
 
+def restore_loader_generator_state(
+    generator: torch.Generator, generator_state: torch.Tensor
+) -> None:
+    """Restore a DataLoader RNG state even when checkpoint mapping used CUDA."""
+    generator.set_state(
+        generator_state.detach().cpu().to(torch.uint8).contiguous()
+    )
+
+
 def train(
     config: TrainingConfig,
     train_loader: Iterable[dict[str, torch.Tensor]],
@@ -234,7 +309,7 @@ def train(
         raise ValueError(f"{config.model_key} requires --prior.")
     if prior is not None and prior.semantics_hash != semantics.stable_hash():
         raise ValueError("Ridge prior data semantics do not match this training run.")
-    expected_prior_blocks = (0,) if config.domain == "quasi" else (0, 1)
+    expected_prior_blocks = (0,) if config.domain == "quasi" else (0, 3)
     if prior is not None and prior.target_blocks != expected_prior_blocks:
         raise ValueError(
             f"PriST-RIS V3.1 {config.domain} requires Ridge target_blocks={expected_prior_blocks}, "
@@ -277,7 +352,7 @@ def train(
     validation: dict[str, object] | None = None
     if resume is not None:
         state = load_checkpoint(resume, device)
-        _require_architecture_version(state, "Resume")
+        require_checkpoint_contract(state, "Resume", expected_domain=config.domain)
         if state.get("training_config") != asdict(config) or state.get("semantics_hash") != semantics.stable_hash() or state.get("prior_metadata") != prior_metadata:
             raise ValueError("Resume configuration, semantics, or prior metadata mismatch.")
         model.load_state_dict(state["model_state"])
@@ -286,7 +361,7 @@ def train(
         generator = _loader_generator(train_loader)
         generator_state = state.get("train_loader_generator_state")
         if generator is not None and generator_state is not None:
-            generator.set_state(generator_state)
+            restore_loader_generator_state(generator, generator_state)
         start_epoch = int(state["epoch"]) + 1
         best_nmse = float(state["best_validation_nmse_linear"])
         stale = int(state.get("stale_epochs", 0))
@@ -296,6 +371,9 @@ def train(
     metadata = {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": (
+            MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
+        ),
         "model_key": config.model_key,
         "domain": config.domain,
         "seed": config.seed,
@@ -332,7 +410,12 @@ def train(
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
                 prediction = model(batch, prior_value)
-                prediction, target = _select(prediction, batch["target_h"], config.target_blocks)
+                prediction, target, _ = _select(
+                    prediction,
+                    batch["target_h"],
+                    config.target_blocks,
+                    tuple(model.output_time_index),
+                )
                 loss, _ = prist_ris_loss(
                     prediction, target, charbonnier_weight=config.charbonnier_weight
                 )
@@ -375,6 +458,9 @@ def train(
             "training_config": asdict(config),
             "model_config": asdict(model.config),
             "semantics_hash": semantics.stable_hash(),
+            "mobility_contract_version": (
+                MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
+            ),
             "data_semantics": semantics.to_dict(),
             "prior_metadata": prior_metadata,
             "rng_state": capture_rng_state(),
@@ -416,6 +502,9 @@ def train(
         "status": "smoke_test" if config.mode == "smoke" else "validation",
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": (
+            MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
+        ),
         "model_key": config.model_key,
         "best_validation_nmse_linear": best_nmse,
         "best_validation_nmse_db": 10 * math.log10(max(best_nmse, 1e-12)),

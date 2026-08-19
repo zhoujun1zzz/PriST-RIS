@@ -43,11 +43,26 @@ class MetricAccumulator:
 class PerQueryMetricAccumulator:
     """Diagnostic query metrics plus energy-correct aggregate ratios."""
 
-    def __init__(self, query_count: int) -> None:
-        self.query_count = query_count
-        self.per_query = [MetricAccumulator() for _ in range(query_count)]
-        self.observed = MetricAccumulator() if query_count == 6 else None
-        self.future = MetricAccumulator() if query_count == 6 else None
+    def __init__(self, query_time_index: int | tuple[int, ...]) -> None:
+        self.query_time_index = (
+            tuple(range(query_time_index))
+            if isinstance(query_time_index, int)
+            else tuple(query_time_index)
+        )
+        self.query_count = len(self.query_time_index)
+        self.per_query = [MetricAccumulator() for _ in self.query_time_index]
+        self.pilot_positions = tuple(
+            position
+            for position, semantic_time in enumerate(self.query_time_index)
+            if semantic_time in {0, 3}
+        )
+        self.non_pilot_positions = tuple(
+            position
+            for position, semantic_time in enumerate(self.query_time_index)
+            if semantic_time not in {0, 3}
+        )
+        self.pilots = MetricAccumulator() if self.pilot_positions else None
+        self.non_pilots = MetricAccumulator() if self.non_pilot_positions else None
         self.overall = MetricAccumulator()
 
     def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
@@ -56,18 +71,30 @@ class PerQueryMetricAccumulator:
         self.overall.update(prediction, target)
         for query in range(self.query_count):
             self.per_query[query].update(prediction[:, query : query + 1], target[:, query : query + 1])
-        if self.observed is not None and self.future is not None:
-            self.observed.update(prediction[:, :2], target[:, :2])
-            self.future.update(prediction[:, 2:], target[:, 2:])
+        if self.pilots is not None:
+            index = torch.tensor(self.pilot_positions, device=prediction.device)
+            self.pilots.update(
+                prediction.index_select(1, index), target.index_select(1, index)
+            )
+        if self.non_pilots is not None:
+            index = torch.tensor(self.non_pilot_positions, device=prediction.device)
+            self.non_pilots.update(
+                prediction.index_select(1, index), target.index_select(1, index)
+            )
 
     def compute(self) -> dict[str, object]:
         result: dict[str, object] = {
-            "per_query": {f"q{index}": metric.compute() for index, metric in enumerate(self.per_query)},
+            "per_query": {
+                f"q{semantic_time}": metric.compute()
+                for semantic_time, metric in zip(
+                    self.query_time_index, self.per_query, strict=True
+                )
+            },
             "overall": self.overall.compute(),
         }
-        if self.query_count == 2:
-            result["observed_anchor_aggregate"] = self.overall.compute()
-        if self.observed is not None and self.future is not None:
-            result["observed_anchor_aggregate"] = self.observed.compute()
-            result["future_aggregate"] = self.future.compute()
+        if self.pilots is not None:
+            result["pilot_anchor_aggregate"] = self.pilots.compute()
+            result["observed_anchor_aggregate"] = self.pilots.compute()
+        if self.non_pilots is not None:
+            result["non_pilot_aggregate"] = self.non_pilots.compute()
         return result

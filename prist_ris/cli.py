@@ -13,7 +13,14 @@ import torch
 
 from .checkpoint import load_checkpoint
 from .complexity import profile_model
-from .contracts import ARCHITECTURE_VERSION, MODEL_ALIASES, MODEL_KEYS, DataSemantics, canonical_model_key
+from .contracts import (
+    ARCHITECTURE_VERSION,
+    MOBILITY_CONTRACT_VERSION,
+    MODEL_ALIASES,
+    MODEL_KEYS,
+    DataSemantics,
+    canonical_model_key,
+)
 from .data import (
     EXPECTED_MOBILITY_COUNTS,
     make_loader,
@@ -22,7 +29,13 @@ from .data import (
     validate_dataset_source,
     write_index_manifest,
 )
-from .engine import TrainingConfig, evaluate, seed_everything, train
+from .engine import (
+    TrainingConfig,
+    evaluate,
+    require_checkpoint_contract,
+    seed_everything,
+    train,
+)
 from .experiments import (
     CAPACITY_HIDDEN,
     LEARNING_RATES,
@@ -91,6 +104,7 @@ def audit_command(args: argparse.Namespace) -> dict[str, object]:
     result = {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
         "test_included": "test" in splits,
         "files": rows,
     }
@@ -122,7 +136,7 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
 @torch.no_grad()
 def _evaluate_prior(prior: RidgePrior, loader: Iterable[dict[str, torch.Tensor]]) -> dict[str, object]:
     metrics = MetricAccumulator()
-    diagnostics = PerQueryMetricAccumulator(len(prior.target_blocks))
+    diagnostics = PerQueryMetricAccumulator(prior.target_blocks)
     blocks = torch.tensor(prior.target_blocks)
     for batch in loader:
         prediction = prior.predict(batch)
@@ -133,7 +147,7 @@ def _evaluate_prior(prior: RidgePrior, loader: Iterable[dict[str, torch.Tensor]]
 
 
 def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
-    target_blocks = args.target_blocks or ((0,) if args.domain == "quasi" else (0, 1))
+    target_blocks = args.target_blocks or ((0,) if args.domain == "quasi" else (0, 3))
     allowed = tuple(range(1 if args.domain == "quasi" else 6))
     if not target_blocks or any(value not in allowed for value in target_blocks):
         raise ValueError(f"Invalid target blocks for {args.domain}: {target_blocks}")
@@ -174,6 +188,9 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
         "status": "validation_prior_fit",
         "method": "PriST-RIS Ridge spatial anchor",
         "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": (
+            MOBILITY_CONTRACT_VERSION if args.domain == "mobility" else None
+        ),
         "domain": args.domain,
         "fit_split": "train",
         "selection_split": "validation",
@@ -232,7 +249,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     )
     target_blocks = args.target_blocks
     if target_blocks is None and args.domain == "mobility" and key != "prist_ris_full":
-        target_blocks = (0, 1)
+        target_blocks = (0, 3)
     config = TrainingConfig(
         domain=args.domain,
         model_key=key,
@@ -380,6 +397,9 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     if args.prior is None or args.reference_checkpoint is None:
         raise ValueError("Executing ablation requires --prior and --reference-checkpoint.")
     reference = load_checkpoint(args.reference_checkpoint, torch.device("cpu"))
+    require_checkpoint_contract(
+        reference, "Ablation reference", expected_domain="mobility"
+    )
     if (
         reference.get("method") != "PriST-RIS"
         or reference.get("architecture_version") != ARCHITECTURE_VERSION
@@ -390,9 +410,9 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     if frozen.get("domain") != "mobility" or int(frozen.get("seed", -1)) != 123:
         raise ValueError("Ablation reference must use Mobility and seed 123.")
     mapping = {
-        "physical_grid_spatial": ("prist_ris_a", "0,1", "trend", True),
-        "prior_guided_dual_anchor": ("prist_ris_b", "0,1", "trend", True),
-        "coordinate_encoding": ("prist_ris_c", "0,1", "trend", True),
+        "physical_grid_spatial": ("prist_ris_a", "0,3", "trend", True),
+        "prior_guided_dual_anchor": ("prist_ris_b", "0,3", "trend", True),
+        "coordinate_encoding": ("prist_ris_c", "0,3", "trend", True),
         "static_last_anchor": ("prist_ris_full", "0,1,2,3,4,5", "static", True),
         "no_delta_conditioning": ("prist_ris_full", "0,1,2,3,4,5", "no_delta", True),
         "trend_conditioned_temporal": ("prist_ris_full", "0,1,2,3,4,5", "trend", True),
@@ -495,9 +515,12 @@ def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     allow_test = _allowed_test(args)
     device = torch.device(args.device)
     state = load_checkpoint(args.checkpoint, device)
-    if state.get("method") != "PriST-RIS" or state.get("architecture_version") != ARCHITECTURE_VERSION:
+    if state.get("method") != "PriST-RIS":
         raise ValueError("Evaluation requires a PriST-RIS V3.1 checkpoint; V3.0 is not loaded silently.")
     model_config = dict(state["model_config"])
+    require_checkpoint_contract(
+        state, "Evaluation", expected_domain=str(model_config["domain"])
+    )
     model = build_model(**model_config).to(device)
     model.load_state_dict(state["model_state"])
     prior_metadata = state.get("prior_metadata")

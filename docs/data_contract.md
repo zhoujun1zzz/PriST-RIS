@@ -12,6 +12,12 @@ Raw shapes are strict:
 - Mobility counts are train 20,000, validation 1,800, test 9,000.
 - Loaded samples must be finite.
 
+Mobility uses grouped complex packing and the canonical pilot-time contract is
+`obs_time_index=(0,3)` with `query_time=(0,1,2,3,4,5)`. The two observations
+are sparse pilots at q0 and q3 inside one frame. q1/q2 lie between the pilots;
+q4/q5 lie after the second pilot. This is frame-internal reconstruction, not
+next-frame prediction or extrapolation from consecutive q0/q1 observations.
+
 The 32 observed positions must be exactly `range(0,256,8)`. Row-major `index=16*row+column` maps them to rows 0–15 and columns `{0,8}`. `observations_to_physical_grid()` validates this before producing `[B,4,64,16,2]`. Quasi pads its absent second time block with zeros. `observation_mask` is not a model input.
 
-Audit excludes test by default and reports `raw_input_shape`, `raw_target_shape`, keys, path, provenance, sample count, and semantics hash.
+Audit excludes test by default and reports `raw_input_shape`, `raw_target_shape`, keys, path, provenance, sample count, and semantics hash. Changing q0/q1 to q0/q3 changes the Mobility semantics hash, so pre-fix Ridge artifacts cannot be loaded by post-fix training.
