@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from .contracts import DataSemantics, METRIC_CONTRACT
+from .contracts import ARCHITECTURE_VERSION, DataSemantics, METRIC_CONTRACT
 
 
 METHOD_NAMES = {
@@ -151,6 +151,10 @@ def freeze_experiment(
             resolved = path.expanduser().resolve()
             if not resolved.is_file():
                 raise FileNotFoundError(f"Cannot freeze missing {kind}: {resolved}")
+            if kind == "checkpoint":
+                state = torch.load(resolved, map_location="cpu", weights_only=False)
+                if state.get("architecture_version") != ARCHITECTURE_VERSION:
+                    raise ValueError("Freeze requires PriST-RIS V3.1 checkpoints only.")
             artifacts.append({"kind": kind, "path": str(resolved), "sha256": sha256(resolved)})
     baseline = None
     if baseline_manifest is not None:
@@ -162,6 +166,7 @@ def freeze_experiment(
     frozen = {
         "schema": "prist_ris.frozen_experiment.v1",
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "commit": current_commit(project),
         "artifacts": artifacts,
         "baseline_manifest": baseline,
@@ -180,7 +185,11 @@ def freeze_experiment(
 
 def validate_test_unlock(freeze_manifest: str | Path, checkpoint: str | Path) -> dict[str, object]:
     frozen = _read_json(freeze_manifest)
-    if frozen.get("schema") != "prist_ris.frozen_experiment.v1" or frozen.get("test_unlocked") is not True:
+    if (
+        frozen.get("schema") != "prist_ris.frozen_experiment.v1"
+        or frozen.get("architecture_version") != ARCHITECTURE_VERSION
+        or frozen.get("test_unlocked") is not True
+    ):
         raise PermissionError("Independent test is locked until a valid frozen experiment manifest unlocks it.")
     resolved = str(Path(checkpoint).expanduser().resolve())
     expected_hash = None

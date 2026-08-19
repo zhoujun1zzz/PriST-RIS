@@ -9,11 +9,11 @@ CAPACITY_HIDDEN = (64, 80, 96)
 LEARNING_RATES = (2e-4, 5e-4, 1e-3)
 TEMPORAL_RANKS = (2, 3)
 MECHANISM_ABLATIONS = (
-    "ris_only_control",
-    "structured_progressive",
-    "prior_guided",
-    "prior_cross_attention",
-    "low_rank_temporal",
+    "physical_grid_spatial",
+    "prior_guided_dual_anchor",
+    "coordinate_encoding",
+    "trend_conditioned_temporal",
+    "temporal_residual",
     "full",
 )
 TRANSFER_FRACTIONS = (0.01, 0.05, 0.10, 0.20, 1.0)
@@ -22,8 +22,10 @@ TRANSFER_PROTOCOLS = (
     "full_finetune",
     "frozen_spatial",
     "selective",
-    "adapter_only",
 )
+
+SPATIAL_ABLATION_TARGET_BLOCKS = (0, 1)
+TEMPORAL_ABLATION_TARGET_BLOCKS = (0, 1, 2, 3, 4, 5)
 
 
 def late_window_score(history_path: str | Path, start: int, end: int) -> dict[str, float | int]:
@@ -56,10 +58,10 @@ def targeted_tuning_plan(domain: str, seed: int = 123) -> dict[str, object]:
         "test_split_used": False,
         "seed": seed,
         "fixed": {
-            "blocks_per_stage": [2, 2, 3],
-            "cross_attention_layers": 1,
-            "heads": 4,
-            "dropout": 0,
+            "architecture_version": "3.1",
+            "blocks_per_stage": [3, 3, 4],
+            "final_refine_blocks": 4,
+            "physical_grid": True,
             "weight_decay": 1e-5,
         },
         "phase_a": {"hidden": list(CAPACITY_HIDDEN), "lr": 5e-4, "epochs": 30, "window": [25, 30]},

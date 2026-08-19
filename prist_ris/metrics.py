@@ -38,3 +38,36 @@ class MetricAccumulator:
             "nmse_linear": linear,
             "nmse_db": 10 * math.log10(max(linear, 1e-12)),
         }
+
+
+class PerQueryMetricAccumulator:
+    """Diagnostic query metrics plus energy-correct aggregate ratios."""
+
+    def __init__(self, query_count: int) -> None:
+        self.query_count = query_count
+        self.per_query = [MetricAccumulator() for _ in range(query_count)]
+        self.observed = MetricAccumulator() if query_count == 6 else None
+        self.future = MetricAccumulator() if query_count == 6 else None
+        self.overall = MetricAccumulator()
+
+    def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
+        if prediction.shape[1] != self.query_count or target.shape[1] != self.query_count:
+            raise ValueError("Per-query accumulator received an unexpected query count.")
+        self.overall.update(prediction, target)
+        for query in range(self.query_count):
+            self.per_query[query].update(prediction[:, query : query + 1], target[:, query : query + 1])
+        if self.observed is not None and self.future is not None:
+            self.observed.update(prediction[:, :2], target[:, :2])
+            self.future.update(prediction[:, 2:], target[:, 2:])
+
+    def compute(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "per_query": {f"q{index}": metric.compute() for index, metric in enumerate(self.per_query)},
+            "overall": self.overall.compute(),
+        }
+        if self.query_count == 2:
+            result["observed_anchor_aggregate"] = self.overall.compute()
+        if self.observed is not None and self.future is not None:
+            result["observed_anchor_aggregate"] = self.observed.compute()
+            result["future_aggregate"] = self.future.compute()
+        return result

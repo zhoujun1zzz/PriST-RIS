@@ -1,15 +1,12 @@
-# Formal protocol
+# V3.1 formal and ablation protocol
 
-Formal training starts only after development checks pass. All selection remains validation-only and FP32.
+Formal work starts only after the seed-123 validation gate. It remains FP32, validation-selected, and freeze-before-test.
 
-Targeted tuning at seed 123:
+Spatial and temporal ablations are separate tables:
 
-1. Capacity: hidden 64/80/96, LR `5e-4`, rank 2, 30 epochs; rank by median validation linear NMSE over epochs 25-30, then best value.
-2. Learning rate: `2e-4`, `5e-4`, `1e-3` at the selected width, 40 epochs; rank over epochs 31-40.
-3. Mobility temporal rank: 2/3 at the selected width/LR, 40 epochs; rank over epochs 31-40.
+- Spatial scope is q0/q1 only: A physical grid, B dual Ridge, C coordinate encoding. Report q0, q1, and energy-correct q0/q1 aggregate.
+- Temporal scope is q0–q5: static last-anchor, no-delta conditioning, trend-conditioned low rank, and Full with future correction. Report every query, q2–q5 aggregate, and overall.
 
-The selected configuration is trained with seeds 123/456/789, maximum 100 epochs, minimum 40 epochs, patience 15, AdamW weight decay `1e-5`, gradient clipping 1.0, and FP32. Mobility batch size is fixed at 32; Quasi batch size may be independently benchmarked and is recorded. `scripts/run_formal_protocol.py --dry-run` emits the complete command set without training.
+No score column mixes a q0/q1-only model with q0–q5 overall. The Full seed-123 reference is reused, not silently retrained.
 
-Mechanism ablation uses Mobility seed 123 and the same frozen optimization settings. The full reference checkpoint is reused rather than retrained. The five trained comparisons cover RIS-only control, structured progressive, prior guidance, cross-attention, and low-rank temporal without the compact residual.
-
-Only after checkpoints, priors, baseline manifest, architecture, hyperparameters, ablation definitions, and PEFT protocol are frozen may test be unlocked. Test evaluation is a single reporting stage and must not feed back into selection.
+Targeted tuning and the three-seed runner remain available but are not launched by code delivery. Formal checkpoints, priors, protocols, and code commit must be frozen before the independent test gate can be opened.

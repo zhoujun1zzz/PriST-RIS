@@ -7,240 +7,330 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .contracts import MODEL_DISPLAY_NAME, canonical_model_key
+from .contracts import (
+    ANTENNAS,
+    ARCHITECTURE_VERSION,
+    MODEL_DISPLAY_NAME,
+    OBSERVED_RIS_INDICES,
+    canonical_model_key,
+)
 
 
-def observations_to_image(observations: torch.Tensor) -> torch.Tensor:
-    """[B,T,32,64,2] -> [B,2T,64,32] with grouped real/imag channels."""
+PHYSICAL_STAGE_COLUMNS: dict[int, tuple[int, ...]] = {
+    2: (0, 8),
+    4: (0, 4, 8, 12),
+    8: tuple(range(0, 16, 2)),
+    16: tuple(range(16)),
+}
 
-    if observations.ndim != 5 or observations.shape[2:] != (32, 64, 2):
+
+def _canonical_indices(obs_ris_index: torch.Tensor, batch_size: int) -> torch.Tensor:
+    if obs_ris_index.ndim == 2:
+        if obs_ris_index.shape != (batch_size, 32):
+            raise ValueError("batched obs_ris_index must have shape [B,32].")
+        expected = obs_ris_index[0]
+        if not torch.equal(obs_ris_index, expected.expand_as(obs_ris_index)):
+            raise ValueError("Every sample must use the same frozen observed RIS indices.")
+    elif obs_ris_index.ndim == 1 and obs_ris_index.shape == (32,):
+        expected = obs_ris_index
+    else:
+        raise ValueError("obs_ris_index must have shape [32] or [B,32].")
+    canonical = torch.tensor(OBSERVED_RIS_INDICES, device=expected.device, dtype=expected.dtype)
+    if not torch.equal(expected, canonical):
+        raise ValueError("Observed RIS indices must be exactly [0,8,...,248].")
+    rows = torch.div(expected, 16, rounding_mode="floor")
+    columns = expected.remainder(16)
+    if not torch.equal(rows, torch.arange(16, device=rows.device).repeat_interleave(2)):
+        raise ValueError("Observed RIS indices do not cover rows 0..15 twice in row-major order.")
+    if not torch.equal(columns, torch.tensor([0, 8], device=columns.device).repeat(16)):
+        raise ValueError("Observed RIS columns must be {0,8} for every row.")
+    return expected
+
+
+def observations_to_physical_grid(
+    observations: torch.Tensor, obs_ris_index: torch.Tensor
+) -> torch.Tensor:
+    """Map [B,T,32,64,2] to [B,4,64,16,2] using validated row-major indices."""
+
+    if observations.ndim != 5 or observations.shape[2:] != (32, ANTENNAS, 2):
         raise ValueError("observations must have shape [B,T,32,64,2].")
-    b, t, _, antennas, _ = observations.shape
-    image = observations.permute(0, 1, 4, 3, 2).reshape(b, 2 * t, antennas, 32)
-    if image.shape[1] < 4:
-        image = F.pad(image, (0, 0, 0, 0, 0, 4 - image.shape[1]))
-    return image
+    b, times = observations.shape[:2]
+    if times not in {1, 2}:
+        raise ValueError("PriST-RIS supports one or two observed time blocks.")
+    _canonical_indices(obs_ris_index, b)
+    grid = observations.reshape(b, times, 16, 2, ANTENNAS, 2)
+    grid = grid.permute(0, 1, 5, 4, 2, 3).reshape(b, 2 * times, ANTENNAS, 16, 2)
+    if grid.shape[1] < 4:
+        grid = F.pad(grid, (0, 0, 0, 0, 0, 0, 0, 4 - grid.shape[1]))
+    return grid.contiguous()
 
 
-def channel_to_image(channel: torch.Tensor) -> torch.Tensor:
-    """[B,1,256,64,2] -> [B,2,64,256]."""
+def physical_grid_to_observations(grid: torch.Tensor, observed_times: int) -> torch.Tensor:
+    """Inverse of observations_to_physical_grid for contract tests."""
 
-    if channel.ndim != 5 or channel.shape[1:] != (1, 256, 64, 2):
-        raise ValueError("spatial prior must have shape [B,1,256,64,2].")
-    return channel[:, 0].permute(0, 3, 2, 1).contiguous()
-
-
-def image_to_anchor(image: torch.Tensor) -> torch.Tensor:
-    """[B,2,64,256] -> [B,1,256,64,2]."""
-
-    if image.ndim != 4 or image.shape[1:] != (2, 64, 256):
-        raise ValueError("anchor image must have shape [B,2,64,256].")
-    return image.permute(0, 3, 2, 1).unsqueeze(1).contiguous()
+    if grid.ndim != 5 or grid.shape[1:] != (4, ANTENNAS, 16, 2):
+        raise ValueError("grid must have shape [B,4,64,16,2].")
+    if observed_times not in {1, 2}:
+        raise ValueError("observed_times must be 1 or 2.")
+    b = grid.shape[0]
+    value = grid[:, : 2 * observed_times].reshape(b, observed_times, 2, ANTENNAS, 16, 2)
+    return value.permute(0, 1, 4, 5, 3, 2).reshape(b, observed_times, 32, ANTENNAS, 2)
 
 
-class FactorizedAntennaRISBlock(nn.Module):
-    """Separate local RIS (1x3) and antenna (3x1) modeling with channel mixing."""
+def prior_to_physical_grid(prior: torch.Tensor) -> torch.Tensor:
+    """Map K complex anchors to [B,4,64,16,16], padding Quasi's second anchor."""
 
-    def __init__(self, hidden: int, *, antenna_branch: bool = True) -> None:
+    if prior.ndim != 5 or prior.shape[1] not in {1, 2} or prior.shape[2:] != (256, ANTENNAS, 2):
+        raise ValueError("prior must have shape [B,1|2,256,64,2].")
+    b, anchors = prior.shape[:2]
+    grid = prior.reshape(b, anchors, 16, 16, ANTENNAS, 2)
+    grid = grid.permute(0, 1, 5, 4, 2, 3).reshape(b, 2 * anchors, ANTENNAS, 16, 16)
+    if anchors == 1:
+        grid = F.pad(grid, (0, 0, 0, 0, 0, 0, 0, 2))
+    return grid.contiguous()
+
+
+def physical_grid_to_anchors(grid: torch.Tensor, anchors: int) -> torch.Tensor:
+    if grid.ndim != 5 or grid.shape[1:] != (4, ANTENNAS, 16, 16):
+        raise ValueError("anchor grid must have shape [B,4,64,16,16].")
+    if anchors not in {1, 2}:
+        raise ValueError("anchors must be 1 or 2.")
+    b = grid.shape[0]
+    value = grid[:, : 2 * anchors].reshape(b, anchors, 2, ANTENNAS, 16, 16)
+    return value.permute(0, 1, 4, 5, 3, 2).reshape(b, anchors, 256, ANTENNAS, 2).contiguous()
+
+
+class RISCoordinateEncoder(nn.Module):
+    """Encode physical RIS row/column coordinates for each progressive stage."""
+
+    def __init__(self, hidden: int) -> None:
         super().__init__()
-        self.antenna_branch_enabled = antenna_branch
-        self.ris_depthwise = nn.Conv2d(
-            hidden, hidden, (1, 3), padding=(0, 1), groups=hidden
+        self.projection = nn.Conv3d(2, hidden, 1)
+
+    @staticmethod
+    def coordinates(width: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if width not in PHYSICAL_STAGE_COLUMNS:
+            raise ValueError(f"Unsupported physical stage width {width}.")
+        rows = torch.arange(16, device=device, dtype=dtype) * (2.0 / 15.0) - 1.0
+        columns = torch.tensor(PHYSICAL_STAGE_COLUMNS[width], device=device, dtype=dtype)
+        columns = columns * (2.0 / 15.0) - 1.0
+        row_grid, column_grid = torch.meshgrid(rows, columns, indexing="ij")
+        return torch.stack((row_grid, column_grid), dim=0).reshape(1, 2, 1, 16, width)
+
+    def forward(self, reference: torch.Tensor) -> torch.Tensor:
+        coordinates = self.coordinates(reference.shape[-1], device=reference.device, dtype=reference.dtype)
+        return self.projection(coordinates).expand(-1, -1, ANTENNAS, -1, -1)
+
+
+class AntennaIndexEncoder(nn.Module):
+    """Encode antenna index only; this is not a physical BS-coordinate claim."""
+
+    semantics = "antenna_index_encoding"
+
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.projection = nn.Conv3d(1, hidden, 1)
+
+    def forward(self, reference: torch.Tensor) -> torch.Tensor:
+        values = torch.arange(ANTENNAS, device=reference.device, dtype=reference.dtype)
+        values = values * (2.0 / (ANTENNAS - 1)) - 1.0
+        return self.projection(values.reshape(1, 1, ANTENNAS, 1, 1)).expand(
+            -1, -1, -1, 16, reference.shape[-1]
         )
-        self.ris_mix = nn.Sequential(
-            nn.Conv2d(hidden, 2 * hidden, 1),
+
+
+class StrongSpatioRISResidualBlock(nn.Module):
+    def __init__(self, hidden: int) -> None:
+        super().__init__()
+        self.body = nn.Sequential(
+            nn.Conv3d(hidden, hidden, 3, padding=1),
             nn.GELU(),
-            nn.Conv2d(2 * hidden, hidden, 1),
+            nn.Conv3d(hidden, hidden, 3, padding=1),
         )
-        if antenna_branch:
-            self.antenna_depthwise: nn.Module | None = nn.Conv2d(
-                hidden, hidden, (3, 1), padding=(1, 0), groups=hidden
-            )
-            self.antenna_mix: nn.Module | None = nn.Sequential(
-                nn.Conv2d(hidden, 2 * hidden, 1),
-                nn.GELU(),
-                nn.Conv2d(2 * hidden, hidden, 1),
-            )
-        else:
-            self.antenna_depthwise = None
-            self.antenna_mix = None
         self.activation = nn.GELU()
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        residual = self.ris_mix(self.ris_depthwise(value))
-        if self.antenna_depthwise is not None and self.antenna_mix is not None:
-            residual = residual + self.antenna_mix(self.antenna_depthwise(value))
-        return value + 0.1 * self.activation(residual)
+        return self.activation(value + self.body(value))
 
 
-class ProgressiveStage(nn.Module):
-    def __init__(self, hidden: int, blocks: int, *, antenna_branch: bool) -> None:
+class PhysicalColumnUpsample(nn.Module):
+    def __init__(self, hidden: int) -> None:
         super().__init__()
-        self.blocks = nn.Sequential(
-            *(
-                FactorizedAntennaRISBlock(hidden, antenna_branch=antenna_branch)
-                for _ in range(blocks)
-            )
-        )
-        self.refine = nn.Sequential(
-            nn.Conv2d(hidden, hidden, 3, padding=1),
-            nn.GELU(),
+        self.upsample = nn.ConvTranspose3d(
+            hidden, hidden, kernel_size=(1, 1, 2), stride=(1, 1, 2)
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
-        value = self.blocks(value)
-        value = F.interpolate(value, scale_factor=(1, 2), mode="nearest")
-        return self.refine(value)
+        before = value.shape
+        result = self.upsample(value)
+        if result.shape[2:4] != before[2:4] or result.shape[-1] != 2 * before[-1]:
+            raise RuntimeError("Physical column upsampling changed a non-column axis.")
+        return result
 
 
-class StructuredProgressiveBackbone(nn.Module):
+class PhysicalProgressiveStage(nn.Module):
+    def __init__(self, hidden: int, blocks: int) -> None:
+        super().__init__()
+        self.upsample = PhysicalColumnUpsample(hidden)
+        self.blocks = nn.Sequential(*(StrongSpatioRISResidualBlock(hidden) for _ in range(blocks)))
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return self.blocks(self.upsample(value))
+
+
+class PhysicalGridBackbone(nn.Module):
     def __init__(
         self,
         hidden: int = 80,
-        blocks_per_stage: tuple[int, int, int] = (2, 2, 3),
+        blocks_per_stage: tuple[int, int, int] = (3, 3, 4),
+        final_refine_blocks: int = 4,
         *,
-        antenna_branch: bool = True,
+        coordinate_enabled: bool,
     ) -> None:
         super().__init__()
-        if len(blocks_per_stage) != 3:
-            raise ValueError("PriST-RIS requires exactly three progressive stages.")
+        if len(blocks_per_stage) != 3 or final_refine_blocks < 1:
+            raise ValueError("V3.1 requires three progressive stages and final refinement.")
         self.hidden = hidden
-        self.input = nn.Conv2d(4, hidden, 3, padding=1)
+        self.coordinate_enabled = coordinate_enabled
+        self.input = nn.Conv3d(4, hidden, 3, padding=1)
+        self.ris_coordinate_encoder = RISCoordinateEncoder(hidden) if coordinate_enabled else None
+        self.antenna_index_encoder = AntennaIndexEncoder(hidden) if coordinate_enabled else None
         self.stages = nn.ModuleList(
-            ProgressiveStage(hidden, blocks, antenna_branch=antenna_branch)
-            for blocks in blocks_per_stage
+            PhysicalProgressiveStage(hidden, blocks) for blocks in blocks_per_stage
+        )
+        self.final_refine = nn.Sequential(
+            *(StrongSpatioRISResidualBlock(hidden) for _ in range(final_refine_blocks))
         )
 
-    def forward(self, observations: torch.Tensor) -> tuple[torch.Tensor, list[tuple[int, ...]]]:
-        value = self.input(observations_to_image(observations))
+    def _coordinates(self, value: torch.Tensor) -> torch.Tensor:
+        if self.ris_coordinate_encoder is None or self.antenna_index_encoder is None:
+            return torch.zeros_like(value)
+        return self.ris_coordinate_encoder(value) + self.antenna_index_encoder(value)
+
+    def forward(
+        self, observations: torch.Tensor, obs_ris_index: torch.Tensor
+    ) -> tuple[torch.Tensor, list[tuple[int, ...]]]:
+        grid = observations_to_physical_grid(observations, obs_ris_index)
+        value = self.input(grid)
+        if self.coordinate_enabled:
+            value = value + self._coordinates(value)
         shapes = [tuple(value.shape)]
         for stage in self.stages:
             value = stage(value)
+            if self.coordinate_enabled:
+                value = value + self._coordinates(value)
             shapes.append(tuple(value.shape))
-        if value.shape[-2:] != (64, 256):
-            raise RuntimeError(f"Progressive backbone ended at {value.shape[-2:]}, expected (64,256).")
+        value = self.final_refine(value)
+        if value.shape[2:] != (ANTENNAS, 16, 16):
+            raise RuntimeError(f"Physical backbone ended at {value.shape[2:]}, expected (64,16,16).")
         return value, shapes
-
-
-class ResidualObservedCrossAttention(nn.Module):
-    """One observed-to-dense residual attention layer; K/V never use targets."""
-
-    def __init__(self, hidden: int, heads: int = 4) -> None:
-        super().__init__()
-        if hidden % heads:
-            raise ValueError("hidden must be divisible by attention heads.")
-        self.observed_encoder = nn.Linear(4, hidden)
-        self.coordinate_encoder = nn.Linear(2, hidden)
-        self.attention = nn.MultiheadAttention(hidden, heads, batch_first=True)
-        columns = torch.linspace(-1, 1, 256)
-        rows = torch.linspace(-1, 1, 64)
-        self.register_buffer(
-            "dense_coordinates",
-            torch.stack(torch.meshgrid(rows, columns, indexing="ij"), dim=-1),
-            persistent=False,
-        )
-        self.last_query_tokens = 0
-        self.last_key_tokens = 0
-
-    def forward(self, dense: torch.Tensor, observed: torch.Tensor) -> torch.Tensor:
-        b, hidden, antennas, nodes = dense.shape
-        obs = observed.permute(0, 3, 2, 1, 4).reshape(b * antennas, 32, -1)
-        if obs.shape[-1] < 4:
-            obs = F.pad(obs, (0, 4 - obs.shape[-1]))
-        memory = self.observed_encoder(obs)
-        query = dense.permute(0, 2, 3, 1).reshape(b * antennas, nodes, hidden)
-        coordinates = self.dense_coordinates.to(dense)
-        coordinate_tokens = self.coordinate_encoder(coordinates).reshape(antennas, nodes, hidden)
-        query = query + coordinate_tokens.repeat(b, 1, 1)
-        delta, _ = self.attention(query, memory, memory, need_weights=False)
-        self.last_query_tokens = int(query.shape[1])
-        self.last_key_tokens = int(memory.shape[1])
-        return (query + delta).reshape(b, antennas, nodes, hidden).permute(0, 3, 1, 2)
 
 
 def complex_factorized_reconstruction(
     bases: torch.Tensor, coefficients: torch.Tensor
 ) -> torch.Tensor:
-    """Multiply complex bases [B,R,N,M,2] by coefficients [B,Q,R,2]."""
+    """FP32 island for complex bases [B,R,N,M,2] and coefficients [B,Q,R,2]."""
 
     if bases.ndim != 5 or coefficients.ndim != 4 or bases.shape[-1] != 2 or coefficients.shape[-1] != 2:
         raise ValueError("Invalid complex basis/coefficient shapes.")
     if bases.shape[0] != coefficients.shape[0] or bases.shape[1] != coefficients.shape[2]:
         raise ValueError("Basis and coefficient batch/rank dimensions must match.")
-    basis = torch.complex(bases[..., 0], bases[..., 1])
-    coeff = torch.complex(coefficients[..., 0], coefficients[..., 1])
-    output = torch.einsum("bqr,brnm->bqnm", coeff, basis)
-    return torch.stack((output.real, output.imag), dim=-1)
+    with torch.amp.autocast(device_type=bases.device.type, enabled=False):
+        bases32, coefficients32 = bases.float(), coefficients.float()
+        basis = torch.complex(bases32[..., 0], bases32[..., 1])
+        coefficient = torch.complex(coefficients32[..., 0], coefficients32[..., 1])
+        output = torch.einsum("bqr,brnm->bqnm", coefficient, basis)
+        return torch.stack((output.real, output.imag), dim=-1)
 
 
-class LowRankTemporalFactorization(nn.Module):
-    def __init__(self, hidden: int, rank: int) -> None:
+class TrendConditionedTemporal(nn.Module):
+    def __init__(self, hidden: int, rank: int, *, use_delta: bool = True) -> None:
         super().__init__()
         if rank not in {2, 3}:
             raise ValueError("PriST-RIS temporal rank must be 2 or 3.")
         self.rank = rank
-        self.basis_head = nn.Conv2d(hidden, 2 * rank, 1)
-        self.observed_context = nn.Linear(2, hidden)
-        self.time_encoder = nn.Sequential(
-            nn.Linear(1, hidden), nn.GELU(), nn.Linear(hidden, hidden)
+        self.use_delta = use_delta
+        self.spatial_encoder = nn.Sequential(
+            nn.Conv3d(6, hidden, 3, padding=1),
+            nn.GELU(),
+            StrongSpatioRISResidualBlock(hidden),
+            StrongSpatioRISResidualBlock(hidden),
         )
-        self.future_fusion = nn.Linear(2 * hidden, hidden)
-        self.coefficient_head = nn.Linear(hidden, 2 * rank)
+        self.basis_head = nn.Conv3d(hidden, 2 * rank, 1)
+        self.anchor_context = nn.Linear(2, hidden)
+        self.time_encoder = nn.Sequential(nn.Linear(1, hidden), nn.GELU(), nn.Linear(hidden, hidden))
+        self.fusion = nn.Sequential(nn.Linear(4 * hidden, 2 * hidden), nn.GELU())
+        self.coefficient_head = nn.Linear(2 * hidden, 2 * rank)
+        self.alpha_head = nn.Linear(2 * hidden, 1)
+        self.last_delta_norm: float | None = None
+        self.last_complex_dtype: torch.dtype | None = None
 
-    def aligned_query_context(
-        self,
-        observations: torch.Tensor,
-        obs_time: torch.Tensor,
-        query_time: torch.Tensor,
-    ) -> torch.Tensor:
-        b, observed_count = observations.shape[:2]
-        if observed_count != obs_time.numel():
-            raise ValueError("Observed tensor/time count mismatch.")
-        pooled = observations.mean(dim=(2, 3))
-        contexts = self.observed_context(pooled)
-        scale = max(1, int(query_time.max().item()))
-        time = self.time_encoder(query_time.to(observations).reshape(-1, 1) / scale)
-        pooled_context = contexts.mean(dim=1)
-        outputs = []
-        for position, query in enumerate(query_time):
-            matches = torch.where(obs_time == query)[0]
-            if matches.numel():
-                outputs.append(contexts[:, int(matches[0])])
-            else:
-                outputs.append(
-                    self.future_fusion(
-                        torch.cat((pooled_context, time[position].expand(b, -1)), dim=-1)
+    def forward(self, anchors: torch.Tensor, query_time: torch.Tensor) -> torch.Tensor:
+        if anchors.shape[1:] != (2, 256, ANTENNAS, 2):
+            raise ValueError("Mobility temporal input must contain A0/A1 dual anchors.")
+        future_time = query_time[2:]
+        if future_time.numel() != 4:
+            raise ValueError("Mobility future queries must be q2..q5.")
+        a0, a1 = anchors[:, 0], anchors[:, 1]
+        delta = a1 - a0 if self.use_delta else torch.zeros_like(a1)
+        self.last_delta_norm = float(delta.detach().norm())
+        temporal_input = torch.cat((a0, a1, delta), dim=-1)
+        temporal_grid = temporal_input.reshape(anchors.shape[0], 256, ANTENNAS, 6)
+        temporal_grid = temporal_grid.reshape(anchors.shape[0], 16, 16, ANTENNAS, 6)
+        temporal_grid = temporal_grid.permute(0, 4, 3, 1, 2).contiguous()
+        features = self.spatial_encoder(temporal_grid)
+        raw_bases = self.basis_head(features)
+        bases = raw_bases.reshape(anchors.shape[0], self.rank, 2, ANTENNAS, 256)
+        bases = bases.permute(0, 1, 4, 3, 2).contiguous()
+        pooled = (a0.mean(dim=(1, 2)), a1.mean(dim=(1, 2)), delta.mean(dim=(1, 2)))
+        contexts = [self.anchor_context(value) for value in pooled]
+        time = future_time.to(anchors).reshape(-1, 1) / 5.0
+        time_context = self.time_encoder(time)
+        fused = []
+        for position in range(4):
+            fused.append(
+                self.fusion(
+                    torch.cat(
+                        (
+                            contexts[0],
+                            contexts[1],
+                            contexts[2],
+                            time_context[position].expand(anchors.shape[0], -1),
+                        ),
+                        dim=-1,
                     )
                 )
-        return torch.stack(outputs, dim=1)
-
-    def forward(
-        self,
-        features: torch.Tensor,
-        observations: torch.Tensor,
-        obs_time: torch.Tensor,
-        query_time: torch.Tensor,
-    ) -> torch.Tensor:
-        b, _, antennas, nodes = features.shape
-        raw_bases = self.basis_head(features).reshape(b, self.rank, 2, antennas, nodes)
-        bases = raw_bases.permute(0, 1, 4, 3, 2).contiguous()
-        context = self.aligned_query_context(observations, obs_time, query_time)
-        coefficients = self.coefficient_head(context).reshape(b, query_time.numel(), self.rank, 2)
-        return complex_factorized_reconstruction(bases, coefficients)
+            )
+        fused_context = torch.stack(fused, dim=1)
+        coefficients = self.coefficient_head(fused_context).reshape(
+            anchors.shape[0], 4, self.rank, 2
+        )
+        residual = complex_factorized_reconstruction(bases, coefficients)
+        self.last_complex_dtype = torch.complex64
+        base_alpha = (future_time.to(anchors) - 1.0).reshape(1, 4, 1, 1, 1)
+        learned_alpha = 0.25 * torch.tanh(self.alpha_head(fused_context)).reshape(
+            anchors.shape[0], 4, 1, 1, 1
+        )
+        return a1.unsqueeze(1) + (base_alpha + learned_alpha) * delta.unsqueeze(1) + residual
 
 
-class TemporalResidualCorrection(nn.Module):
-    def __init__(self) -> None:
+class FutureResidualCorrection(nn.Module):
+    def __init__(self, hidden: int = 24) -> None:
         super().__init__()
-        self.depthwise = nn.Conv2d(2, 2, 3, padding=1, groups=2)
-        self.pointwise = nn.Conv2d(2, 2, 1)
+        self.input = nn.Conv3d(2, hidden, 3, padding=1)
+        self.blocks = nn.Sequential(
+            StrongSpatioRISResidualBlock(hidden), StrongSpatioRISResidualBlock(hidden)
+        )
+        self.output = nn.Conv3d(hidden, 2, 3, padding=1)
 
-    def forward(self, value: torch.Tensor) -> torch.Tensor:
-        b, q, nodes, antennas, _ = value.shape
-        image = value.permute(0, 1, 4, 3, 2).reshape(b * q, 2, antennas, nodes)
-        correction = self.pointwise(F.gelu(self.depthwise(image)))
-        correction = correction.reshape(b, q, 2, antennas, nodes).permute(0, 1, 4, 3, 2)
-        return value + 0.1 * correction
+    def forward(self, future: torch.Tensor) -> torch.Tensor:
+        if future.shape[1:] != (4, 256, ANTENNAS, 2):
+            raise ValueError("Temporal correction only accepts q2..q5.")
+        b = future.shape[0]
+        grid = future.reshape(b * 4, 16, 16, ANTENNAS, 2).permute(0, 4, 3, 1, 2)
+        correction = self.output(self.blocks(F.gelu(self.input(grid))))
+        correction = correction.permute(0, 3, 4, 2, 1).reshape(b, 4, 256, ANTENNAS, 2)
+        return future + correction
 
 
 @dataclass(frozen=True)
@@ -248,90 +338,124 @@ class PriSTRISConfig:
     model_key: str
     domain: str
     hidden: int = 80
-    blocks_per_stage: tuple[int, int, int] = (2, 2, 3)
-    heads: int = 4
-    dropout: float = 0.0
+    blocks_per_stage: tuple[int, int, int] = (3, 3, 4)
+    final_refine_blocks: int = 4
     temporal_rank: int = 2
-    antenna_branch: bool = True
     temporal_residual: bool = True
+    coordinate_enabled: bool | None = None
+    temporal_mode: str = "trend"
+    architecture_version: str = ARCHITECTURE_VERSION
 
 
 class PriSTRIS(nn.Module):
-    """Canonical PriST-RIS implementation for controlled A/B/C/Full variants."""
+    """Canonical PriST-RIS V3.1 physical-grid implementation."""
 
     def __init__(self, config: PriSTRISConfig) -> None:
         super().__init__()
         key = canonical_model_key(config.model_key)
-        if config.dropout != 0:
-            raise ValueError("The initial PriST-RIS protocol fixes dropout=0.")
-        self.config = PriSTRISConfig(**{**asdict(config), "model_key": key})
-        obs_blocks = 1 if config.domain == "quasi" else 2
-        query_blocks = 1 if config.domain == "quasi" else 6
-        self.obs_blocks = obs_blocks
-        self.query_blocks = query_blocks
-        self.backbone = StructuredProgressiveBackbone(
+        if config.architecture_version != ARCHITECTURE_VERSION:
+            raise ValueError("PriST-RIS model config architecture version mismatch.")
+        if config.domain not in {"quasi", "mobility"}:
+            raise ValueError("domain must be quasi or mobility.")
+        coordinate_enabled = (
+            key in {"prist_ris_c", "prist_ris_full"}
+            if config.coordinate_enabled is None
+            else config.coordinate_enabled
+        )
+        self.config = PriSTRISConfig(
+            **{**asdict(config), "model_key": key, "coordinate_enabled": coordinate_enabled}
+        )
+        self.anchor_count = 1 if config.domain == "quasi" else 2
+        self.uses_prior = key in {"prist_ris_b", "prist_ris_c", "prist_ris_full"}
+        self.backbone = PhysicalGridBackbone(
             config.hidden,
             config.blocks_per_stage,
-            antenna_branch=config.antenna_branch,
+            config.final_refine_blocks,
+            coordinate_enabled=coordinate_enabled,
         )
-        self.uses_prior = key in {"prist_ris_b", "prist_ris_c", "prist_ris_full"}
-        self.prior_encoder = nn.Conv2d(2, config.hidden, 1) if self.uses_prior else None
-        self.cross_attention = (
-            ResidualObservedCrossAttention(config.hidden, config.heads)
-            if key in {"prist_ris_c", "prist_ris_full"}
-            else None
+        self.prior_encoder = nn.Conv3d(4, config.hidden, 1) if self.uses_prior else None
+        self.anchor_feature = nn.Sequential(
+            nn.Conv3d(config.hidden, config.hidden, 3, padding=1), nn.GELU()
         )
-        self.anchor_head = nn.Conv2d(config.hidden, 2, 3, padding=1)
+        self.anchor_heads = nn.ModuleList(
+            nn.Conv3d(config.hidden, 2, 3, padding=1) for _ in range(self.anchor_count)
+        )
+        has_temporal = key == "prist_ris_full" and config.domain == "mobility"
+        if config.temporal_mode not in {"trend", "no_delta", "static"}:
+            raise ValueError("temporal_mode must be trend, no_delta, or static.")
         self.temporal = (
-            LowRankTemporalFactorization(config.hidden, config.temporal_rank)
-            if key == "prist_ris_full"
+            TrendConditionedTemporal(
+                config.hidden,
+                config.temporal_rank,
+                use_delta=config.temporal_mode != "no_delta",
+            )
+            if has_temporal and config.temporal_mode != "static"
             else None
         )
         self.temporal_correction = (
-            TemporalResidualCorrection()
+            FutureResidualCorrection()
             if self.temporal is not None and config.temporal_residual
             else None
         )
+        self.last_stage_shapes: list[tuple[int, ...]] = []
+
+    def spatial_anchors(
+        self, batch: Mapping[str, torch.Tensor], prior: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        features, shapes = self.backbone(batch["obs_h"], batch["obs_ris_index"])
+        self.last_stage_shapes = shapes
+        if self.uses_prior:
+            if prior is None:
+                raise ValueError(f"{self.config.model_key} requires an explicit Ridge prior artifact.")
+            if prior.shape[1] != self.anchor_count:
+                raise ValueError(
+                    f"{self.config.domain} V3.1 prior must contain {self.anchor_count} anchor(s)."
+                )
+            features = features + self.prior_encoder(prior_to_physical_grid(prior))  # type: ignore[operator]
+        anchor_features = self.anchor_feature(features)
+        anchor_grids = torch.cat([head(anchor_features) for head in self.anchor_heads], dim=1)
+        if self.anchor_count == 1:
+            anchor_grids = F.pad(anchor_grids, (0, 0, 0, 0, 0, 0, 0, 2))
+        delta = physical_grid_to_anchors(anchor_grids, self.anchor_count)
+        return delta + prior if self.uses_prior and prior is not None else delta
+
+    def forward(
+        self, batch: Mapping[str, torch.Tensor], prior: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        anchors = self.spatial_anchors(batch, prior)
+        if self.config.domain == "quasi" or self.config.model_key != "prist_ris_full":
+            return anchors
+        if self.config.temporal_mode == "static":
+            future = anchors[:, 1:2].expand(-1, 4, -1, -1, -1)
+        else:
+            query_time = batch["query_time"][0] if batch["query_time"].ndim > 1 else batch["query_time"]
+            future = self.temporal(anchors, query_time)  # type: ignore[operator]
+        if self.temporal_correction is not None:
+            future = self.temporal_correction(future)
+        return torch.cat((anchors, future), dim=1)
 
     def protocol_metadata(self) -> dict[str, object]:
         return {
             "method": MODEL_DISPLAY_NAME,
+            "architecture_version": ARCHITECTURE_VERSION,
             "canonical_model_key": self.config.model_key,
+            "physical_grid": True,
+            "physical_ris_shapes": ["16x2", "16x4", "16x8", "16x16"],
+            "strong_spatio_ris_conv3d": True,
             "prior_guided": self.uses_prior,
-            "progressive_ris_widths": [32, 64, 128, 256],
-            "factorized_antenna_ris": self.config.antenna_branch,
-            "cross_attention_layers": 1 if self.cross_attention is not None else 0,
-            "attention_heads": self.config.heads,
+            "prior_anchors": self.anchor_count if self.uses_prior else 0,
+            "coordinate_enabled": self.config.coordinate_enabled,
+            "antenna_encoding_semantics": "antenna_index_encoding",
+            "cross_attention_layers": 0,
+            "temporal_mode": (
+                self.config.temporal_mode
+                if self.config.domain == "mobility" and self.config.model_key == "prist_ris_full"
+                else None
+            ),
             "temporal_rank": self.config.temporal_rank if self.temporal is not None else None,
             "future_target_inputs": False,
+            "observation_mask_used": False,
         }
-
-    def forward(
-        self,
-        batch: Mapping[str, torch.Tensor],
-        prior: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        observations = batch["obs_h"]
-        features, _ = self.backbone(observations)
-        if self.uses_prior:
-            if prior is None:
-                raise ValueError(f"{self.config.model_key} requires an explicit Ridge prior artifact.")
-            features = features + self.prior_encoder(channel_to_image(prior))  # type: ignore[operator]
-        if self.cross_attention is not None:
-            features = self.cross_attention(features, observations)
-        delta_anchor = image_to_anchor(self.anchor_head(features))
-        anchor = delta_anchor + prior if prior is not None and self.uses_prior else delta_anchor
-        if self.temporal is None:
-            return anchor.expand(-1, self.query_blocks, -1, -1, -1).contiguous()
-        obs_time = batch["obs_time_index"][0] if batch["obs_time_index"].ndim > 1 else batch["obs_time_index"]
-        query_time = batch["query_time"][0] if batch["query_time"].ndim > 1 else batch["query_time"]
-        factorized = self.temporal(features, observations, obs_time, query_time)
-        # The learned dense spatial anchor is the reference surface for every
-        # queried block; the low-rank temporal factors model only its residual.
-        output = anchor.expand(-1, self.query_blocks, -1, -1, -1) + factorized
-        if self.temporal_correction is not None:
-            output = self.temporal_correction(output)
-        return output
 
 
 def build_model(
@@ -339,12 +463,13 @@ def build_model(
     *,
     domain: str,
     hidden: int = 80,
-    blocks_per_stage: tuple[int, int, int] = (2, 2, 3),
-    heads: int = 4,
-    dropout: float = 0.0,
+    blocks_per_stage: tuple[int, int, int] = (3, 3, 4),
+    final_refine_blocks: int = 4,
     temporal_rank: int = 2,
-    antenna_branch: bool = True,
     temporal_residual: bool = True,
+    coordinate_enabled: bool | None = None,
+    temporal_mode: str = "trend",
+    architecture_version: str = ARCHITECTURE_VERSION,
 ) -> PriSTRIS:
     return PriSTRIS(
         PriSTRISConfig(
@@ -352,23 +477,26 @@ def build_model(
             domain=domain,
             hidden=hidden,
             blocks_per_stage=blocks_per_stage,
-            heads=heads,
-            dropout=dropout,
+            final_refine_blocks=final_refine_blocks,
             temporal_rank=temporal_rank,
-            antenna_branch=antenna_branch,
             temporal_residual=temporal_residual,
+            coordinate_enabled=coordinate_enabled,
+            temporal_mode=temporal_mode,
+            architecture_version=architecture_version,
         )
     )
 
 
-def canonical_batch(domain: str, batch_size: int = 1, device: str | torch.device = "cpu") -> dict[str, torch.Tensor]:
-    obs_blocks, query_blocks = ((1, 1) if domain == "quasi" else (2, 6))
+def canonical_batch(
+    domain: str, batch_size: int = 1, device: torch.device | None = None
+) -> dict[str, torch.Tensor]:
+    device = device or torch.device("cpu")
+    times, queries = ((1, 1) if domain == "quasi" else (2, 6))
     return {
-        "obs_h": torch.randn(batch_size, obs_blocks, 32, 64, 2, device=device),
-        "target_h": torch.randn(batch_size, query_blocks, 256, 64, 2, device=device),
-        "obs_ris_index": torch.arange(0, 256, 8, device=device).expand(batch_size, -1),
-        "obs_time_index": torch.arange(obs_blocks, device=device).expand(batch_size, -1),
-        "query_time": torch.arange(query_blocks, device=device).expand(batch_size, -1),
-        "observation_mask": torch.ones(batch_size, obs_blocks, 32, dtype=torch.bool, device=device),
+        "obs_h": torch.zeros(batch_size, times, 32, ANTENNAS, 2, device=device),
+        "target_h": torch.zeros(batch_size, queries, 256, ANTENNAS, 2, device=device),
+        "obs_ris_index": torch.tensor(OBSERVED_RIS_INDICES, device=device).expand(batch_size, -1),
+        "obs_time_index": torch.arange(times, device=device).expand(batch_size, -1),
+        "query_time": torch.arange(queries, device=device).expand(batch_size, -1),
         "sample_index": torch.arange(batch_size, device=device),
     }

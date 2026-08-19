@@ -1,20 +1,17 @@
-# Data contract
+# PriST-RIS V3.1 data contract
 
-PriST-RIS has one immutable data interpretation.
+`resolve_dataset_source()` is the single source resolver used by Dataset, audit, and DataLoader. Every resolved source records domain, split, path, input/target keys, and provenance.
 
-## Quasi-static
+Quasi train uses `input_da/output_da`. Quasi validation first prefers a separate validation file with `Yd/Hd`, then falls back to `input_da_test/output_da_test` in the train HDF5. Quasi test uses a separate `Yd/Hd` file. Mobility uses `Yd/Hd` for all splits.
 
-- Train HDF5 keys: `input_da`, `output_da`.
-- Validation/test keys: `Yd`, `Hd`.
-- Loader output: observation `[B,1,32,64,2]`, target `[B,1,256,64,2]`.
+Raw shapes are strict:
 
-## Mobility
+- Quasi input `[2,32,64,N]`, target `[2,256,64,N]`.
+- Mobility input `[4,32,64,N]`, target `[12,256,64,N]`.
+- Input/target sample counts must match.
+- Mobility counts are train 20,000, validation 1,800, test 9,000.
+- Loaded samples must be finite.
 
-- Keys: `Yd`, `Hd`.
-- Exact counts: train 20,000; validation 1,800; test 9,000.
-- Loader output: observation `[B,2,32,64,2]`, target `[B,6,256,64,2]`.
-- Query blocks belong to the same sample; no cross-sample sequence is constructed.
+The 32 observed positions must be exactly `range(0,256,8)`. Row-major `index=16*row+column` maps them to rows 0–15 and columns `{0,8}`. `observations_to_physical_grid()` validates this before producing `[B,4,64,16,2]`. Quasi pads its absent second time block with zeros. `observation_mask` is not a model input.
 
-The first half of the raw leading channel dimension is real and the second half is imaginary. The loader stacks them into the final complex axis. The 32 observations correspond to RIS indices `range(0,256,8)`. Grid coordinates follow row-major `index=16*row+column`. Observed times are `[0]` for Quasi and `[0,1]` for Mobility; query times are `[0]` and `[0,1,2,3,4,5]` respectively.
-
-Supported discovery layouts include `<root>/<domain>/<stem>/<file>`, `<root>/<file>`, and the legacy `<root>/risce[/risce-0]/<stem>/<file>` trees. Test construction is denied unless `allow_test=True`, which only the freeze-validated evaluation path supplies.
+Audit excludes test by default and reports `raw_input_shape`, `raw_target_shape`, keys, path, provenance, sample count, and semantics hash.

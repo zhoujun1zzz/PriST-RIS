@@ -27,7 +27,7 @@ def main() -> None:
     parser.add_argument("--mobility-prior", required=True)
     parser.add_argument("--quasi-best-result", required=True)
     parser.add_argument("--mobility-best-result", required=True)
-    parser.add_argument("--output-root", default="runs/formal_prist_ris")
+    parser.add_argument("--output-root", default="runs/v3_1_formal")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quasi-batch-size", type=int, default=32)
     parser.add_argument("--dry-run", action="store_true")
@@ -37,6 +37,7 @@ def main() -> None:
     root = Path(args.output_root)
     protocol = {
         "method": "PriST-RIS",
+        "architecture_version": "3.1",
         "fp32": True,
         "test_split_used": False,
         "stage_f_enabled": False,
@@ -54,12 +55,14 @@ def main() -> None:
     ):
         best = json.loads(Path(best_path).read_text(encoding="utf-8"))["best_hyperparameters"]
         for seed in SEEDS:
-            name = f"{domain}_prist_ris_full_seed{seed}"
+            name = f"v31_{domain}_prist_ris_full_seed{seed}"
             run(
                 [
                     "train", "--domain", domain, "--model", "prist_ris_full",
                     "--mode", "full", "--seed", seed, "--hidden", best["hidden"],
                     "--learning-rate", best["learning_rate"],
+                    "--blocks-per-stage", ",".join(str(v) for v in best.get("blocks_per_stage", [3, 3, 4])),
+                    "--final-refine-blocks", best.get("final_refine_blocks", 4),
                     "--temporal-rank", best.get("temporal_rank", 2),
                     "--prior", prior, "--data-root", args.data_root,
                     "--device", args.device, "--batch-size", args.quasi_batch_size if domain == "quasi" else 32,

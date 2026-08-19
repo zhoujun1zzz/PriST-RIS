@@ -1,14 +1,14 @@
-# Development protocol
+# V3.1 development protocol
 
-Development never uses test data.
+Development is validation-only and writes new artifacts under `runs/v3_1_dev/` or names prefixed `v31_`. Existing `runs/v3_dev/`, Ridge files, checkpoints, and V3.0 diagnostics are not deleted or overwritten.
 
-1. Run `audit`; confirm the four train/validation files and semantics hashes.
-2. Run the complete unit suite.
-3. Fit Ridge candidates on train and select regularization on validation.
-4. Run `profile` for shape, parameters, GMACs/GFLOPs, batch-1 latency, and CUDA peak memory.
-5. Use `train --mode smoke` for a one-epoch 64/16-sample integration check.
-6. Use `train --mode dev` for at most 4,096 train samples and 1,800 validation samples. It runs 30 epochs and extends to 45 only when the best epoch lies in 26-30.
+Sequence:
 
-AMP results are development diagnostics and are never treated as formal results. Formal runs reject AMP. The loss is sample-level linear NMSE plus a small Charbonnier term; ranking always uses validation linear NMSE.
+1. Run audit and confirm all four train/validation sources, keys, shapes, and provenance.
+2. Run the full test suite, including CUDA AMP tests when CUDA is available.
+3. Fit Quasi Ridge on target block 0 and Mobility Ridge on blocks 0/1 using train only; choose regularization on validation.
+4. Run C smoke first and inspect q0, q1, and observed-anchor aggregate.
+5. Only after the spatial gate, run Full smoke and inspect q0–q5, observed, future, and overall diagnostics.
+6. Use `mode=dev` only for the first Mobility seed-123 validation run. Do not start formal three-seed or broad HPO automatically.
 
-Tests cover the frozen shapes, grouped-complex mapping, progressive widths, factorized branches, Ridge round-trip, observed-only attention, temporal alignment/ranks, target non-leakage, parameter ceiling, metric contract, test lock, checkpoint metadata, tiny overfit, and bitwise deterministic resume.
+Formal mode rejects AMP. Smoke/dev AMP is supported through an FP32 complex island. No development command authorizes test.

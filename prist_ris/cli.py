@@ -9,17 +9,17 @@ import time
 from pathlib import Path
 from typing import Iterable
 
-import h5py
 import torch
 
 from .checkpoint import load_checkpoint
 from .complexity import profile_model
-from .contracts import MODEL_ALIASES, MODEL_KEYS, DataSemantics, canonical_model_key
+from .contracts import ARCHITECTURE_VERSION, MODEL_ALIASES, MODEL_KEYS, DataSemantics, canonical_model_key
 from .data import (
     EXPECTED_MOBILITY_COUNTS,
     make_loader,
     nested_fraction_indices,
-    resolve_dataset_path,
+    resolve_dataset_source,
+    validate_dataset_source,
     write_index_manifest,
 )
 from .engine import TrainingConfig, evaluate, seed_everything, train
@@ -30,6 +30,8 @@ from .experiments import (
     TEMPORAL_RANKS,
     TRANSFER_FRACTIONS,
     TRANSFER_PROTOCOLS,
+    SPATIAL_ABLATION_TARGET_BLOCKS,
+    TEMPORAL_ABLATION_TARGET_BLOCKS,
     late_window_score,
     targeted_tuning_plan,
     write_plan,
@@ -39,7 +41,7 @@ from .manifests import (
     import_baseline_manifest,
     validate_test_unlock,
 )
-from .metrics import MetricAccumulator
+from .metrics import MetricAccumulator, PerQueryMetricAccumulator
 from .models import build_model
 from .prior import RidgePrior, RidgeStatistics, file_sha256
 
@@ -76,33 +78,22 @@ def audit_command(args: argparse.Namespace) -> dict[str, object]:
         if args.freeze_manifest is None:
             raise PermissionError("Audit excludes test before a freeze manifest is supplied.")
         frozen = json.loads(Path(args.freeze_manifest).read_text(encoding="utf-8"))
-        if frozen.get("test_unlocked") is not True:
+        if (
+            frozen.get("architecture_version") != ARCHITECTURE_VERSION
+            or frozen.get("test_unlocked") is not True
+        ):
             raise PermissionError("The supplied freeze manifest does not unlock test.")
         splits.append("test")
     rows = []
     for domain in ("quasi", "mobility"):
         for split in splits:
-            path = resolve_dataset_path(args.data_root, domain, split)
-            with h5py.File(path, "r") as handle:
-                input_key = "input_da" if domain == "quasi" and split == "train" else "Yd"
-                target_key = "output_da" if domain == "quasi" and split == "train" else "Hd"
-                count = int(handle[input_key].shape[-1])
-                rows.append(
-                    {
-                        "domain": domain,
-                        "split": split,
-                        "path": str(path),
-                        "input_key": input_key,
-                        "target_key": target_key,
-                        "input_shape": list(handle[input_key].shape),
-                        "target_shape": list(handle[target_key].shape),
-                        "samples": count,
-                        "semantics_hash": DataSemantics.for_domain(domain).stable_hash(),
-                    }
-                )
-                if domain == "mobility" and count != EXPECTED_MOBILITY_COUNTS[split]:
-                    raise ValueError(f"Unexpected Mobility {split} sample count: {count}")
-    result = {"method": "PriST-RIS", "test_included": "test" in splits, "files": rows}
+            rows.append(validate_dataset_source(resolve_dataset_source(args.data_root, domain, split)))
+    result = {
+        "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
+        "test_included": "test" in splits,
+        "files": rows,
+    }
     _json(args.output, result)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return result
@@ -114,10 +105,12 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
         args.model,
         domain=args.domain,
         hidden=args.hidden,
-        heads=args.heads,
+        blocks_per_stage=args.blocks_per_stage,
+        final_refine_blocks=args.final_refine_blocks,
         temporal_rank=args.temporal_rank,
-        antenna_branch=not args.ris_only,
         temporal_residual=not args.no_temporal_residual,
+        coordinate_enabled=args.coordinate_enabled,
+        temporal_mode=args.temporal_mode,
     ).to(device)
     result = profile_model(model, domain=args.domain, device=device)
     if args.output:
@@ -127,20 +120,23 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
 
 
 @torch.no_grad()
-def _evaluate_prior(prior: RidgePrior, loader: Iterable[dict[str, torch.Tensor]]) -> dict[str, float | int]:
+def _evaluate_prior(prior: RidgePrior, loader: Iterable[dict[str, torch.Tensor]]) -> dict[str, object]:
     metrics = MetricAccumulator()
+    diagnostics = PerQueryMetricAccumulator(len(prior.target_blocks))
     blocks = torch.tensor(prior.target_blocks)
     for batch in loader:
         prediction = prior.predict(batch)
         target = batch["target_h"].index_select(1, blocks)
         metrics.update(prediction, target)
-    return metrics.compute()
+        diagnostics.update(prediction, target)
+    return {**metrics.compute(), "diagnostics": diagnostics.compute()}
 
 
 def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
-    target_blocks = args.target_blocks
-    if tuple(target_blocks) != (0,):
-        raise ValueError("The initial PriST-RIS protocol freezes the spatial anchor target to block 0.")
+    target_blocks = args.target_blocks or ((0,) if args.domain == "quasi" else (0, 1))
+    allowed = tuple(range(1 if args.domain == "quasi" else 6))
+    if not target_blocks or any(value not in allowed for value in target_blocks):
+        raise ValueError(f"Invalid target blocks for {args.domain}: {target_blocks}")
     train_loader = make_loader(
         args.data_root,
         args.domain,
@@ -163,7 +159,7 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
     )
     statistics = RidgeStatistics.accumulate(train_loader, tuple(target_blocks))
     candidates = []
-    winner: tuple[float, RidgePrior, dict[str, float | int]] | None = None
+    winner: tuple[float, RidgePrior, dict[str, object]] | None = None
     semantics = DataSemantics.for_domain(args.domain)
     for regularization in args.regularizations:
         prior = statistics.solve(regularization, semantics)
@@ -177,6 +173,7 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
     result = {
         "status": "validation_prior_fit",
         "method": "PriST-RIS Ridge spatial anchor",
+        "architecture_version": ARCHITECTURE_VERSION,
         "domain": args.domain,
         "fit_split": "train",
         "selection_split": "validation",
@@ -234,19 +231,20 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         shuffle=False,
     )
     target_blocks = args.target_blocks
-    if target_blocks is None and key != "prist_ris_full":
-        target_blocks = (0,)
+    if target_blocks is None and args.domain == "mobility" and key != "prist_ris_full":
+        target_blocks = (0, 1)
     config = TrainingConfig(
         domain=args.domain,
         model_key=key,
         mode=args.mode,
         seed=args.seed,
         hidden=args.hidden,
-        blocks_per_stage=(2, 2, 3),
-        heads=args.heads,
+        blocks_per_stage=args.blocks_per_stage,
+        final_refine_blocks=args.final_refine_blocks,
         temporal_rank=args.temporal_rank,
-        antenna_branch=not args.ris_only,
         temporal_residual=not args.no_temporal_residual,
+        coordinate_enabled=args.coordinate_enabled,
+        temporal_mode=args.temporal_mode,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         epochs=args.epochs or default_epochs,
@@ -258,7 +256,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         target_blocks=target_blocks,
         adaptation=args.adaptation,
     )
-    run_name = args.run_name or f"{args.domain}_{key}_{args.mode}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_name = args.run_name or f"v31_{args.domain}_{key}_{args.mode}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
     return train(
         config,
         train_loader,
@@ -330,6 +328,7 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
     result = {
         "status": "validation_search",
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "domain": args.domain,
         "test_split_used": False,
         "capacity_ranking": capacity,
@@ -339,9 +338,8 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
             "hidden": selected_hidden,
             "learning_rate": selected_lr,
             "temporal_rank": selected_rank,
-            "blocks_per_stage": [2, 2, 3],
-            "heads": 4,
-            "dropout": 0,
+            "blocks_per_stage": [3, 3, 4],
+            "final_refine_blocks": 4,
             "weight_decay": 1e-5,
         },
     }
@@ -352,9 +350,25 @@ def tune_command(args: argparse.Namespace) -> dict[str, object]:
 def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     plan = {
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "domain": "mobility",
         "seed": 123,
-        "variants": list(MECHANISM_ABLATIONS),
+        "mechanisms": list(MECHANISM_ABLATIONS),
+        "spatial_table": {
+            "variants": ["physical_grid_spatial", "prior_guided_dual_anchor", "coordinate_encoding"],
+            "target_blocks": list(SPATIAL_ABLATION_TARGET_BLOCKS),
+            "score_column": "observed_anchor_aggregate",
+        },
+        "temporal_table": {
+            "variants": [
+                "static_last_anchor",
+                "no_delta_conditioning",
+                "trend_conditioned_temporal",
+                "full",
+            ],
+            "target_blocks": list(TEMPORAL_ABLATION_TARGET_BLOCKS),
+            "score_column": "overall",
+        },
         "reference_retrained": False,
         "test_split_used": False,
     }
@@ -366,26 +380,35 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     if args.prior is None or args.reference_checkpoint is None:
         raise ValueError("Executing ablation requires --prior and --reference-checkpoint.")
     reference = load_checkpoint(args.reference_checkpoint, torch.device("cpu"))
-    if reference.get("method") != "PriST-RIS" or reference.get("model_config", {}).get("model_key") != "prist_ris_full":
-        raise ValueError("Ablation reference must be the frozen PriST-RIS Full seed-123 checkpoint.")
+    if (
+        reference.get("method") != "PriST-RIS"
+        or reference.get("architecture_version") != ARCHITECTURE_VERSION
+        or reference.get("model_config", {}).get("model_key") != "prist_ris_full"
+    ):
+        raise ValueError("Ablation reference must be the frozen PriST-RIS V3.1 Full seed-123 checkpoint.")
     frozen = reference.get("training_config", {})
     if frozen.get("domain") != "mobility" or int(frozen.get("seed", -1)) != 123:
         raise ValueError("Ablation reference must use Mobility and seed 123.")
     mapping = {
-        "ris_only_control": ("prist_ris_a", True, False),
-        "structured_progressive": ("prist_ris_a", False, False),
-        "prior_guided": ("prist_ris_b", False, False),
-        "prior_cross_attention": ("prist_ris_c", False, False),
-        "low_rank_temporal": ("prist_ris_full", False, True),
+        "physical_grid_spatial": ("prist_ris_a", "0,1", "trend", True),
+        "prior_guided_dual_anchor": ("prist_ris_b", "0,1", "trend", True),
+        "coordinate_encoding": ("prist_ris_c", "0,1", "trend", True),
+        "static_last_anchor": ("prist_ris_full", "0,1,2,3,4,5", "static", True),
+        "no_delta_conditioning": ("prist_ris_full", "0,1,2,3,4,5", "no_delta", True),
+        "trend_conditioned_temporal": ("prist_ris_full", "0,1,2,3,4,5", "trend", True),
     }
     rows = []
-    for variant, (model, ris_only, no_residual) in mapping.items():
+    for variant, (model, target_scope, temporal_mode, no_residual) in mapping.items():
         arguments: list[object] = [
             "train", "--domain", "mobility", "--model", model, "--mode", "full",
             "--seed", 123, "--data-root", args.data_root,
             "--device", args.device, "--run-name", variant, "--output-root", root / "trials",
-            "--hidden", frozen["hidden"], "--heads", frozen["heads"],
+            "--hidden", frozen["hidden"],
+            "--blocks-per-stage", ",".join(str(v) for v in frozen["blocks_per_stage"]),
+            "--final-refine-blocks", frozen["final_refine_blocks"],
             "--temporal-rank", frozen["temporal_rank"],
+            "--temporal-mode", temporal_mode,
+            "--target-blocks", target_scope,
             "--learning-rate", frozen["learning_rate"],
             "--weight-decay", frozen["weight_decay"],
             "--epochs", frozen["epochs"], "--min-epochs", frozen["min_epochs"],
@@ -393,8 +416,6 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
         ]
         if model != "prist_ris_a":
             arguments.extend(["--prior", args.prior])
-        if ris_only:
-            arguments.append("--ris-only")
         if no_residual:
             arguments.append("--no-temporal-residual")
         _invoke(arguments, dry_run=False)
@@ -402,7 +423,7 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
         rows.append({"variant": variant, "status": "trained", "result": final})
     rows.append(
         {
-            "variant": "full_reference",
+            "variant": "full",
             "status": "reused_not_retrained",
             "best_validation_nmse_linear": reference["best_validation_nmse_linear"],
             "checkpoint": str(Path(args.reference_checkpoint).resolve()),
@@ -426,7 +447,8 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
         "seed": 123,
         "fractions": list(TRANSFER_FRACTIONS),
         "protocols": list(TRANSFER_PROTOCOLS),
-        "runs": 25,
+        "runs": 20,
+        "transfer_scope": "spatial_only",
         "nested_sample_manifest": str(manifest.resolve()),
         "test_split_used": False,
     }
@@ -439,10 +461,14 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
     source = load_checkpoint(args.source_checkpoint, torch.device("cpu"))
     source_config = source.get("training_config", {})
     source_model = source.get("model_config", {})
-    if source.get("method") != "PriST-RIS" or source_config.get("domain") != "quasi":
-        raise ValueError("Transfer source must be a Quasi PriST-RIS checkpoint.")
-    if source_model.get("model_key") != "prist_ris_full":
-        raise ValueError("Transfer source must use prist_ris_full.")
+    if (
+        source.get("method") != "PriST-RIS"
+        or source.get("architecture_version") != ARCHITECTURE_VERSION
+        or source_config.get("domain") != "quasi"
+    ):
+        raise ValueError("Transfer source must be a Quasi PriST-RIS V3.1 checkpoint.")
+    if source_model.get("model_key") not in {"prist_ris_c", "prist_ris_full"}:
+        raise ValueError("Transfer source must use coordinate-enabled Quasi spatial weights.")
     for fraction in TRANSFER_FRACTIONS:
         for protocol in TRANSFER_PROTOCOLS:
             name = f"fraction_{fraction:.2f}_{protocol}"
@@ -452,7 +478,8 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
                 "--sample-index-manifest", manifest, "--adaptation", protocol,
                 "--prior", args.prior, "--data-root", args.data_root,
                 "--device", args.device, "--hidden", source_config["hidden"],
-                "--heads", source_config["heads"],
+                "--blocks-per-stage", ",".join(str(v) for v in source_config["blocks_per_stage"]),
+                "--final-refine-blocks", source_config["final_refine_blocks"],
                 "--temporal-rank", source_config["temporal_rank"],
                 "--learning-rate", source_config["learning_rate"],
                 "--weight-decay", source_config["weight_decay"],
@@ -468,8 +495,8 @@ def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     allow_test = _allowed_test(args)
     device = torch.device(args.device)
     state = load_checkpoint(args.checkpoint, device)
-    if state.get("method") != "PriST-RIS":
-        raise ValueError("Checkpoint is not a PriST-RIS checkpoint.")
+    if state.get("method") != "PriST-RIS" or state.get("architecture_version") != ARCHITECTURE_VERSION:
+        raise ValueError("Evaluation requires a PriST-RIS V3.1 checkpoint; V3.0 is not loaded silently.")
     model_config = dict(state["model_config"])
     model = build_model(**model_config).to(device)
     model.load_state_dict(state["model_state"])
@@ -499,6 +526,7 @@ def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     )
     payload = {
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "split": args.split,
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "freeze_manifest": str(Path(args.freeze_manifest).resolve()) if args.freeze_manifest else None,
@@ -532,16 +560,23 @@ def freeze_command(args: argparse.Namespace) -> dict[str, object]:
 
 def report_command(args: argparse.Namespace) -> dict[str, object]:
     rows = []
+    legacy_rows = []
     for path in Path(args.runs_root).rglob("final_result.json"):
         value = json.loads(path.read_text(encoding="utf-8"))
         if value.get("method") == "PriST-RIS":
-            rows.append({"path": str(path.resolve()), **value})
+            row = {"path": str(path.resolve()), **value}
+            if value.get("architecture_version") == ARCHITECTURE_VERSION:
+                rows.append(row)
+            else:
+                legacy_rows.append(row)
     baselines = None
     if args.baseline_manifest and args.baseline_manifest.is_file():
         baselines = json.loads(args.baseline_manifest.read_text(encoding="utf-8"))
     result = {
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "validation_runs": rows,
+        "legacy_runs_preserved": legacy_rows,
         "external_baselines": baselines,
         "test_results_included": any(row.get("split") == "test" for row in rows),
     }
@@ -553,10 +588,17 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", choices=ALL_MODEL_KEYS, default="prist_ris_full")
     parser.add_argument("--domain", choices=("quasi", "mobility"), required=True)
     parser.add_argument("--hidden", type=int, default=80)
-    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--blocks-per-stage", type=csv_ints, default=(3, 3, 4))
+    parser.add_argument("--final-refine-blocks", type=int, default=4)
     parser.add_argument("--temporal-rank", type=int, choices=(2, 3), default=2)
-    parser.add_argument("--ris-only", action="store_true")
     parser.add_argument("--no-temporal-residual", action="store_true")
+    parser.add_argument(
+        "--coordinate-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override canonical coordinate setting for controlled ablation.",
+    )
+    parser.add_argument("--temporal-mode", choices=("trend", "no_delta", "static"), default="trend")
 
 
 def add_runtime_arguments(parser: argparse.ArgumentParser) -> None:
@@ -585,7 +627,7 @@ def parser() -> argparse.ArgumentParser:
     prior = commands.add_parser("fit-prior")
     add_runtime_arguments(prior)
     prior.add_argument("--domain", choices=("quasi", "mobility"), required=True)
-    prior.add_argument("--target-blocks", type=csv_ints, default=(0,))
+    prior.add_argument("--target-blocks", type=csv_ints)
     prior.add_argument("--regularizations", type=csv_floats, default=(1e-5, 1e-4, 1e-3))
     prior.add_argument("--batch-size", type=int, default=64)
     prior.add_argument("--eval-batch-size", type=int, default=64)
@@ -619,7 +661,7 @@ def parser() -> argparse.ArgumentParser:
     training.add_argument("--sample-index-manifest", type=Path)
     training.add_argument("--stop-after-epoch", type=int, help="Graceful preemption point; does not alter the frozen training config.")
     training.add_argument("--run-name")
-    training.add_argument("--output-root", type=Path, default=Path("runs"))
+    training.add_argument("--output-root", type=Path, default=Path("runs/v3_1_dev"))
     training.set_defaults(func=train_command)
 
     tune = commands.add_parser("tune")
