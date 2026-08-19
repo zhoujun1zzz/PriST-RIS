@@ -15,8 +15,8 @@ import numpy as np
 import torch
 
 from .checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, save_checkpoint_atomic
-from .contracts import DataSemantics, canonical_model_key
-from .metrics import MetricAccumulator
+from .contracts import ARCHITECTURE_VERSION, DataSemantics, canonical_model_key
+from .metrics import MetricAccumulator, PerQueryMetricAccumulator
 from .models import PriSTRIS, build_model
 from .objectives import prist_ris_loss
 from .prior import RidgePrior, file_sha256
@@ -41,11 +41,12 @@ class TrainingConfig:
     mode: str = "dev"
     seed: int = 123
     hidden: int = 80
-    blocks_per_stage: tuple[int, int, int] = (2, 2, 3)
-    heads: int = 4
+    blocks_per_stage: tuple[int, int, int] = (3, 3, 4)
+    final_refine_blocks: int = 4
     temporal_rank: int = 2
-    antenna_branch: bool = True
     temporal_residual: bool = True
+    coordinate_enabled: bool | None = None
+    temporal_mode: str = "trend"
     learning_rate: float = 5e-4
     weight_decay: float = 1e-5
     epochs: int = 30
@@ -56,31 +57,36 @@ class TrainingConfig:
     amp: bool = False
     target_blocks: tuple[int, ...] | None = None
     adaptation: str = "full"
+    architecture_version: str = ARCHITECTURE_VERSION
 
     def normalized(self) -> "TrainingConfig":
         return TrainingConfig(**{**asdict(self), "model_key": canonical_model_key(self.model_key)})
 
 
 def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
-    valid = {"target_only_scratch", "full_finetune", "frozen_spatial", "selective", "adapter_only", "full"}
+    valid = {"target_only_scratch", "full_finetune", "frozen_spatial", "selective", "full"}
     if protocol not in valid:
         raise ValueError(f"Unknown adaptation protocol {protocol!r}.")
     for parameter in model.parameters():
         parameter.requires_grad_(protocol in {"target_only_scratch", "full_finetune", "full"})
     if protocol == "frozen_spatial":
-        for module in (model.temporal, model.temporal_correction):
+        for module in (model.anchor_feature, model.anchor_heads, model.temporal, model.temporal_correction):
             if module is not None:
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
     elif protocol == "selective":
-        for module in (model.cross_attention, model.temporal, model.temporal_correction, model.anchor_head):
+        for module in (
+            model.prior_encoder,
+            model.anchor_feature,
+            model.anchor_heads,
+            model.temporal_correction,
+        ):
             if module is not None:
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
-    elif protocol == "adapter_only":
-        for module in (model.temporal, model.temporal_correction):
-            if module is not None:
-                for parameter in module.parameters():
+        if model.temporal is not None:
+            for name, parameter in model.temporal.named_parameters():
+                if name.startswith(("anchor_context", "time_encoder", "fusion", "coefficient_head", "alpha_head")):
                     parameter.requires_grad_(True)
     names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     if not names:
@@ -103,16 +109,73 @@ def evaluate(
     *,
     prior: RidgePrior | None,
     target_blocks: tuple[int, ...] | None,
-) -> dict[str, float | int]:
+) -> dict[str, object]:
     model.eval()
     metrics = MetricAccumulator()
+    diagnostics: PerQueryMetricAccumulator | None = None
     for raw in loader:
         batch = move_batch(raw, device)
         prior_value = prior.predict(batch) if prior is not None else None
         prediction = model(batch, prior_value)
         prediction, target = _select(prediction, batch["target_h"], target_blocks)
         metrics.update(prediction, target)
-    return metrics.compute()
+        if diagnostics is None:
+            diagnostics = PerQueryMetricAccumulator(prediction.shape[1])
+        diagnostics.update(prediction, target)
+    result: dict[str, object] = dict(metrics.compute())
+    if diagnostics is not None:
+        result["diagnostics"] = diagnostics.compute()
+    return result
+
+
+def _require_architecture_version(state: dict[str, object], purpose: str) -> None:
+    if state.get("architecture_version") != ARCHITECTURE_VERSION:
+        raise ValueError(
+            f"{purpose} requires architecture_version={ARCHITECTURE_VERSION}; "
+            f"checkpoint has {state.get('architecture_version')!r}."
+        )
+
+
+def load_spatial_pretrained(model: PriSTRIS, state: dict[str, object]) -> dict[str, object]:
+    """Load only structurally compatible Quasi spatial weights into Mobility."""
+
+    _require_architecture_version(state, "Spatial transfer")
+    source_config = state.get("model_config")
+    if not isinstance(source_config, dict) or source_config.get("domain") != "quasi":
+        raise ValueError("Spatial transfer source must be a Quasi PriST-RIS V3.1 checkpoint.")
+    current = model.state_dict()
+    source_state = state.get("model_state")
+    if not isinstance(source_state, dict):
+        raise ValueError("Pretrained checkpoint lacks model_state.")
+    allowed_prefixes = (
+        "backbone.",
+        "prior_encoder.",
+        "anchor_feature.",
+        "anchor_heads.0.",
+    )
+    loaded: list[str] = []
+    skipped: list[str] = []
+    update: dict[str, torch.Tensor] = {}
+    for name, value in source_state.items():
+        if not name.startswith(allowed_prefixes):
+            skipped.append(name)
+        elif name in current and isinstance(value, torch.Tensor) and value.shape == current[name].shape:
+            update[name] = value
+            loaded.append(name)
+        else:
+            skipped.append(name)
+    current.update(update)
+    model.load_state_dict(current)
+    initialized = sorted(set(current) - set(loaded))
+    if not loaded:
+        raise ValueError("Spatial transfer loaded no compatible weights.")
+    return {
+        "mode": "spatial_only",
+        "source_architecture_version": state.get("architecture_version"),
+        "loaded_keys": sorted(loaded),
+        "skipped_keys": sorted(skipped),
+        "newly_initialized_keys": initialized,
+    }
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -152,6 +215,8 @@ def train(
     stop_after_epoch: int | None = None,
 ) -> dict[str, object]:
     config = config.normalized()
+    if config.architecture_version != ARCHITECTURE_VERSION:
+        raise ValueError("Training config architecture version mismatch.")
     if config.mode == "full" and config.amp:
         raise ValueError("Formal PriST-RIS training is FP32; AMP is development-only.")
     if run_dir.exists() and resume is None:
@@ -169,6 +234,12 @@ def train(
         raise ValueError(f"{config.model_key} requires --prior.")
     if prior is not None and prior.semantics_hash != semantics.stable_hash():
         raise ValueError("Ridge prior data semantics do not match this training run.")
+    expected_prior_blocks = (0,) if config.domain == "quasi" else (0, 1)
+    if prior is not None and prior.target_blocks != expected_prior_blocks:
+        raise ValueError(
+            f"PriST-RIS V3.1 {config.domain} requires Ridge target_blocks={expected_prior_blocks}, "
+            f"got {prior.target_blocks}."
+        )
     prior_metadata = (
         {**prior.metadata(), "path": str(Path(prior_path).resolve()), "sha256": file_sha256(prior_path)}
         if prior is not None and prior_path is not None
@@ -180,32 +251,33 @@ def train(
         domain=config.domain,
         hidden=config.hidden,
         blocks_per_stage=config.blocks_per_stage,
-        heads=config.heads,
+        final_refine_blocks=config.final_refine_blocks,
         temporal_rank=config.temporal_rank,
-        antenna_branch=config.antenna_branch,
         temporal_residual=config.temporal_residual,
+        coordinate_enabled=config.coordinate_enabled,
+        temporal_mode=config.temporal_mode,
+        architecture_version=config.architecture_version,
     ).to(device)
+    pretrained_metadata = None
     if pretrained is not None:
         source = load_checkpoint(pretrained, device)
-        source_config = source.get("training_config")
-        if not isinstance(source_config, dict):
-            raise ValueError("Pretrained checkpoint lacks training_config.")
-        compatibility_keys = ("hidden", "blocks_per_stage", "heads", "temporal_rank", "antenna_branch")
-        mismatches = {key: (source_config.get(key), asdict(config).get(key)) for key in compatibility_keys if source_config.get(key) != asdict(config).get(key)}
-        if mismatches:
-            raise ValueError(f"Structurally incompatible source checkpoint: {mismatches}")
-        missing, unexpected = model.load_state_dict(source["model_state"], strict=False)
-        allowed_missing = {name for name in missing if name.startswith(("temporal", "temporal_correction"))}
-        if set(missing) != allowed_missing or unexpected:
-            raise ValueError(f"Unsafe pretrained load; missing={missing}, unexpected={unexpected}")
+        pretrained_metadata = load_spatial_pretrained(model, source)
+        print(
+            f"spatial transfer loaded={len(pretrained_metadata['loaded_keys'])} "
+            f"skipped={len(pretrained_metadata['skipped_keys'])} "
+            f"initialized={len(pretrained_metadata['newly_initialized_keys'])}",
+            flush=True,
+        )
     trainable_names = configure_adaptation(model, config.adaptation)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
     start_epoch, best_nmse, stale = 1, float("inf"), 0
     history: list[dict[str, object]] = []
+    validation: dict[str, object] | None = None
     if resume is not None:
         state = load_checkpoint(resume, device)
+        _require_architecture_version(state, "Resume")
         if state.get("training_config") != asdict(config) or state.get("semantics_hash") != semantics.stable_hash() or state.get("prior_metadata") != prior_metadata:
             raise ValueError("Resume configuration, semantics, or prior metadata mismatch.")
         model.load_state_dict(state["model_state"])
@@ -219,8 +291,11 @@ def train(
         best_nmse = float(state["best_validation_nmse_linear"])
         stale = int(state.get("stale_epochs", 0))
         history = list(state.get("history", []))
+        stored_validation = state.get("validation")
+        validation = stored_validation if isinstance(stored_validation, dict) else None
     metadata = {
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "model_key": config.model_key,
         "domain": config.domain,
         "seed": config.seed,
@@ -230,6 +305,7 @@ def train(
         "amp": config.amp,
         "formal_fp32": config.mode == "full",
         "adaptation": config.adaptation,
+        "pretrained_transfer": pretrained_metadata,
         "total_parameters": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameters": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
         "trainable_parameter_names": trainable_names,
@@ -291,6 +367,7 @@ def train(
         history.append(row)
         state = {
             "method": "PriST-RIS",
+            "architecture_version": ARCHITECTURE_VERSION,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "epoch": epoch,
@@ -308,6 +385,7 @@ def train(
             ),
             "stale_epochs": stale,
             "history": history,
+            "validation": validation,
         }
         save_checkpoint_atomic(checkpoints / "last_checkpoint.pth", state)
         if improved:
@@ -326,14 +404,24 @@ def train(
         if epoch >= config.min_epochs and stale >= config.patience:
             break
         epoch += 1
+    if validation is None:
+        validation = evaluate(
+            model,
+            validation_loader,
+            device,
+            prior=prior,
+            target_blocks=config.target_blocks,
+        )
     final = {
         "status": "smoke_test" if config.mode == "smoke" else "validation",
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "model_key": config.model_key,
         "best_validation_nmse_linear": best_nmse,
         "best_validation_nmse_db": 10 * math.log10(max(best_nmse, 1e-12)),
         "epochs_completed": int(history[-1]["epoch"]),
         "wall_clock_seconds": time.perf_counter() - started,
+        "last_validation": validation,
         "metadata": metadata,
         "test_split_used": False,
     }

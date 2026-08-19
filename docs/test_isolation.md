@@ -1,5 +1,7 @@
 # Independent-test isolation
 
+This gate applies unchanged to PriST-RIS V3.1. Freeze additionally rejects checkpoints whose `architecture_version` is not exactly `3.1`.
+
 Test is locked by default at three layers:
 
 1. Dataset construction rejects `split=test` unless explicitly authorized.

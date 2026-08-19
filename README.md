@@ -1,72 +1,67 @@
-# PriST-RIS
+# PriST-RIS V3.1
 
-PriST-RIS (Prior-guided Structured Progressive Spatio-Temporal RIS reconstruction) is a standalone PyTorch research project for RIS channel reconstruction. It does not import or modify the earlier V1/LPAN repositories.
+PriST-RIS is a standalone PyTorch project for prior-guided spatio-temporal RIS channel reconstruction. Architecture version **3.1** replaces the V3.0 flattened RIS axis with an explicitly validated physical `16×2` observation grid and a strong three-dimensional progressive backbone.
 
-The canonical code identifiers are `prist_ris_a`, `prist_ris_b`, `prist_ris_c`, and `prist_ris_full`. Legacy `v3_*` strings are accepted only as input aliases and are normalized immediately; checkpoints, reports, and metadata always record **PriST-RIS**.
+V3.0 evidence remains reproducible at commit `f10c90ecd1f3bb4d3764e9aa709db9843be0f995`; V3.1 does not overwrite its runs, checkpoints, Ridge artifacts, or logs. V3.1 checkpoints carry `architecture_version="3.1"` and ordinary resume/evaluate paths reject V3.0 checkpoints.
 
-## Frozen tasks
+## Canonical model ladder
 
-| Domain | Observation | Prediction |
-|---|---:|---:|
-| Quasi-static | `[B,1,32,64,2]` | `[B,1,256,64,2]` |
-| Mobility | `[B,2,32,64,2]` | `[B,6,256,64,2]` |
+| Key | Physical-grid strong spatial | Dual Ridge prior | Coordinate encoding | Trend temporal |
+|---|---:|---:|---:|---:|
+| `prist_ris_a` | yes | no | no | no |
+| `prist_ris_b` | yes | yes | no | no |
+| `prist_ris_c` | yes | yes | yes | no |
+| `prist_ris_full` | yes | yes | yes | yes |
 
-Complex values use grouped real/imaginary storage. Observed RIS indices are exactly `0,8,...,248`; the 256 RIS elements use `index = 16*row + column`. Mobility is an in-sample two-observed-block to six-query-block task. NMSE is computed per sample in linear scale, averaged, and converted to dB once.
+Canonical V3.1 contains no cross-attention and accepts no old `v3_c_prior_crossattn` alias. Mobility A/B/C output the two spatial anchors A0/A1. Full returns `[B,6,256,64,2]` with exact `q0=A0`, `q1=A1`; only q2–q5 use `Delta=A1-A0`, trend-conditioned low-rank reconstruction, and optional future-only correction. Quasi returns one spatial anchor and does not pretend to pretrain forecasting.
 
-## Architecture
+## Frozen data and metric
 
-- Structured progressive spatial reconstruction expands only the RIS axis: `32 -> 64 -> 128 -> 256`.
-- Every local block separates a depthwise `1x3` RIS branch and a depthwise `3x1` antenna branch.
-- A train-only Ridge artifact supplies an explicit dense spatial anchor.
-- One optional four-head observed-to-dense residual cross-attention layer uses 32 observed K/V tokens and 256 dense Q tokens.
-- Rank-2 or rank-3 complex temporal factorization aligns queries 0/1 to observed blocks and predicts future blocks without target access.
-- A compact depthwise residual corrector refines the temporal output.
+- Quasi: `[B,1,32,64,2] -> [B,1,256,64,2]`.
+- Mobility: `[B,2,32,64,2] -> [B,6,256,64,2]` within each sample.
+- Observed RIS indices: `0,8,...,248`, validated as `(row=0..15, col={0,8})`.
+- Physical progression: `16×2 -> 16×4 -> 16×8 -> 16×16`; antenna-index axis remains 64.
+- Raw complex layout: grouped real channels followed by grouped imaginary channels.
+- Main metric: per-sample linear NMSE, sample mean, then one dB conversion.
 
-## Install and verify
+## Install and test
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+```bash
 python -m pip install -e ".[dev]"
 pytest -q
 ```
 
-CUDA is recommended for training. Formal runs are FP32; `--amp` is accepted only for smoke/development runs.
+## Validation-only development
 
-## Safe local workflow
+```bash
+export PRIST_RIS_DATA_ROOT=/root/autodl-tmp/lpan
 
-Set the dataset root to a directory containing the existing `risce` and `risce-0` trees (or use the layouts documented in `docs/data_contract.md`).
+prist-ris audit \
+  --data-root "$PRIST_RIS_DATA_ROOT" \
+  --output reports/generated/v31_data_audit.json
 
-```powershell
-prist-ris audit --data-root D:\data
-prist-ris fit-prior --domain quasi --data-root D:\data --output artifacts\ridge_quasi.npz
-prist-ris fit-prior --domain mobility --data-root D:\data --output artifacts\ridge_mobility.npz
-prist-ris profile --domain mobility --model prist_ris_full --device cuda
-prist-ris train --domain mobility --model prist_ris_full --mode smoke --data-root D:\data --prior artifacts\ridge_mobility.npz
+prist-ris fit-prior \
+  --domain mobility \
+  --data-root "$PRIST_RIS_DATA_ROOT" \
+  --max-train 4096 --max-validation 1800 \
+  --workers 8 --batch-size 64 --eval-batch-size 64 \
+  --output artifacts/v31_ridge_mobility_dev4096.npz
+
+prist-ris train \
+  --domain mobility --model prist_ris_c --mode smoke --seed 123 \
+  --prior artifacts/v31_ridge_mobility_dev4096.npz \
+  --data-root "$PRIST_RIS_DATA_ROOT" --device cuda \
+  --workers 8 --batch-size 16 --eval-batch-size 32 \
+  --run-name v31_mobility_C_smoke --output-root runs/v3_1_dev
+
+prist-ris train \
+  --domain mobility --model prist_ris_full --mode smoke --seed 123 \
+  --prior artifacts/v31_ridge_mobility_dev4096.npz \
+  --data-root "$PRIST_RIS_DATA_ROOT" --device cuda \
+  --workers 8 --batch-size 16 --eval-batch-size 32 \
+  --run-name v31_mobility_full_smoke --output-root runs/v3_1_dev
 ```
 
-`audit` reads train and validation only. `evaluate --split test` is rejected unless an exact checkpoint hash is present in a valid freeze manifest with test explicitly unlocked.
+`audit` reads train and validation only. `evaluate --split test` remains protected by the exact freeze-manifest path/hash gate. Formal training remains FP32; AMP is development-only and its complex reconstruction runs inside an explicit FP32/complex64 island.
 
-## Experiment commands
-
-```text
-prist-ris audit
-prist-ris profile
-prist-ris fit-prior
-prist-ris train
-prist-ris tune
-prist-ris ablate
-prist-ris transfer
-prist-ris import-baselines
-prist-ris freeze
-prist-ris evaluate
-prist-ris report
-```
-
-Planning commands are non-destructive unless `--execute` is supplied. Formal three-seed commands are generated/run by `scripts/run_formal_protocol.py`. No long formal training is launched by repository setup.
-
-## Reproducibility and provenance
-
-Each run stores the invoked command, normalized config, semantics hash, sample indices, prior path/hash, parameter accounting, training history, best/last checkpoints, RNG state, DataLoader generator state, and validation result. Resume rejects config, prior, or data-semantics mismatches. A graceful `--stop-after-epoch` supports deterministic preemption without changing the frozen training config.
-
-See `docs/` for the data, model, development, formal, baseline-reuse, PEFT, test-isolation, and result-provenance contracts.
+See `docs/` for the data, model, development, formal, transfer, isolation, and provenance contracts.

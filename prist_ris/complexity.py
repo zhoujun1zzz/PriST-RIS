@@ -7,6 +7,7 @@ import torch
 from torch import nn
 
 from .models import PriSTRIS, canonical_batch
+from .contracts import ARCHITECTURE_VERSION
 
 
 @torch.no_grad()
@@ -20,37 +21,30 @@ def profile_model(
 ) -> dict[str, Any]:
     batch = canonical_batch(domain, device=device)
     if model.uses_prior and prior is None:
-        prior = torch.zeros(1, 1, 256, 64, 2, device=device)
+        anchors = 1 if domain == "quasi" else 2
+        prior = torch.zeros(1, anchors, 256, 64, 2, device=device)
     macs = 0
     hooks = []
 
     def count(module: nn.Module, inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
         nonlocal macs
-        if isinstance(module, nn.Conv2d):
-            kernel = module.kernel_size[0] * module.kernel_size[1]
+        if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose3d)):
+            kernel = 1
+            for width in module.kernel_size:
+                kernel *= width
             macs += int(output.numel() * (module.in_channels // module.groups) * kernel)
         elif isinstance(module, nn.Linear):
             macs += int(output.numel() * module.in_features)
 
     for module in model.modules():
-        if isinstance(module, (nn.Conv2d, nn.Linear)):
+        if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose3d, nn.Linear)):
             hooks.append(module.register_forward_hook(count))
     output = model(batch, prior)
     for hook in hooks:
         hook.remove()
     batch_size = int(batch["obs_h"].shape[0])
-    if model.cross_attention is not None:
-        hidden = model.config.hidden
-        antennas, queries, keys = 64, 256, 32
-        # Q/K/V/out projections plus QK^T and attention-value products.
-        macs += batch_size * antennas * (
-            queries * hidden * hidden
-            + 2 * keys * hidden * hidden
-            + queries * hidden * hidden
-            + 2 * queries * keys * hidden
-        )
     if model.temporal is not None:
-        queries = 1 if domain == "quasi" else 6
+        queries = 4
         # One complex multiply-accumulate is counted as four real MACs.
         macs += 4 * batch_size * queries * model.config.temporal_rank * 256 * 64
     if device.type == "cuda":
@@ -71,10 +65,15 @@ def profile_model(
     trainable = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
     return {
         "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
         "model_key": model.config.model_key,
         "domain": domain,
         "input_shape": list(batch["obs_h"].shape),
         "output_shape": list(output.shape),
+        "stage_shapes": [list(shape) for shape in model.last_stage_shapes],
+        "coordinate_enabled": model.config.coordinate_enabled,
+        "prior_anchors": model.anchor_count if model.uses_prior else 0,
+        "temporal_rank": model.config.temporal_rank if model.temporal is not None else None,
         "parameters": parameters,
         "trainable_parameters": trainable,
         "macs": macs,
@@ -84,7 +83,7 @@ def profile_model(
         "latency_ms_batch1": latency_ms,
         "peak_gpu_memory_bytes": peak,
         "convention": (
-            "batch1 FP32 single forward; convolution, linear, attention contractions, "
+            "batch1 FP32 single forward; Conv2d/Conv3d/ConvTranspose3d, linear, "
             "and complex low-rank reconstruction; 1 real MAC=2 FLOPs"
         ),
     }

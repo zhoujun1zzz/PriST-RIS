@@ -1,16 +1,16 @@
-# PriST-RIS model contract
+# PriST-RIS V3.1 model contract
 
-The paper-facing model name and all newly written metadata use **PriST-RIS**. The implementation has a single `PriSTRIS` class with four canonical configurations:
+Architecture version is `3.1`. Default spatial configuration is hidden 80, progressive block depths `[3,3,4]`, and four dense final-refinement blocks.
 
-| Key | Structured spatial | Ridge anchor | Cross-attention | Low-rank temporal |
-|---|---|---|---|---|
-| `prist_ris_a` | yes | no | no | no |
-| `prist_ris_b` | yes | yes | no | no |
-| `prist_ris_c` | yes | yes | yes | no |
-| `prist_ris_full` | yes | yes | yes | yes |
+The backbone treats dimensions as antenna-index × RIS-row × RIS-column. A learned column upsampler performs `16×2 -> 16×4 -> 16×8 -> 16×16` without changing the 64 antenna-index or 16 RIS-row axes. Strong residual blocks use two full `3×3×3` Conv3d layers and no fixed 0.1 residual scale or BatchNorm.
 
-The default width is 80 with stage depths `[2,2,3]`, four attention heads, zero dropout, and temporal rank 2. Width candidates are 64/80/96 and temporal ranks are 2/3 only.
+Coordinate-enabled C/Full adds two independent encoders at the observed grid and every progressive stage:
 
-The backbone maps `[B,4,64,32]` to `[B,H,64,256]`; Quasi pads its two absent observation channels so source and target models remain structurally compatible. Each progressive stage doubles only the last (RIS) dimension. Factorized blocks contain independent depthwise `1x3` and `3x1` paths followed by pointwise channel mixing.
+- RIS coordinates use normalized physical row and the actual stage columns `{0,8}`, `{0,4,8,12}`, even columns, or all columns.
+- Antenna encoding is explicitly named **antenna index encoding**; no physical BS geometry is claimed.
 
-The Ridge prediction is encoded and added to dense features. The learned anchor head produces an explicit residual over that prior. Cross-attention obtains keys and values only from observed tensors. The temporal module produces complex spatial bases and query coefficients, then performs explicit complex multiplication. Queries 0 and 1 reuse the matching observed contexts; later queries use only pooled observed context and time encoding. The compact temporal correction has one depthwise and one pointwise layer.
+Mobility Ridge predicts A0/A1 from both observed pilot blocks. A shared anchor feature layer and separate anchor heads produce learned residuals; B/C/Full add them to the dual prior. Quasi uses only A0.
+
+Full preserves q0=A0 and q1=A1 exactly. For q2–q5 it encodes the spatial tensors A0, A1, and Delta=A1−A0, retains their separate pooled contexts, combines them with query time, and predicts rank-2/3 complex residuals plus learned trend coefficients. The optional physical-grid correction is applied only to q2–q5.
+
+Canonical V3.1 contains no cross-attention. A/B/C are spatial models; Full is the temporal model.

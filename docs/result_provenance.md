@@ -1,18 +1,11 @@
-# Result provenance
+# V3.1 result provenance
 
-Each run directory is immutable unless explicitly resumed. It contains:
+Every V3.1 metadata file, model config, checkpoint, profile, and report records `architecture_version="3.1"`. Resume and evaluation require an exact version match; V3.0 checkpoints are not silently loaded. Spatial transfer is the only special loading path and records every loaded/skipped/new key.
 
-```text
-command.txt
-config.json
-metadata.json
-checkpoints/{best_checkpoint,last_checkpoint}.pth
-results/{training_history.csv,final_result.json}
-manifests/{data_semantics,sample_indices,prior}.json
-```
+Run directories retain command, normalized config, metadata, data semantics, exact sample indices, Ridge path/hash, best/last checkpoints, optimizer, RNG and DataLoader-generator states, history, parameter accounting, and validation diagnostics. All smoke/dev results record `test_split_used=false`.
 
-Checkpoints include model and optimizer state, completed epoch, best validation linear NMSE, normalized model/training configs, exact data semantics/hash, Ridge metadata/path/hash, Python/NumPy/PyTorch/CUDA RNG state, DataLoader generator state, staleness counter, and history. Resume requires exact equality of config, semantics, and prior metadata.
+Mobility diagnostics contain q0–q5 linear NMSE/dB, q0/q1 observed-anchor aggregate, q2–q5 future aggregate, and overall. Overall remains the energy ratio over all selected tensors per sample; it is not the mean of per-query dB.
 
-The profile convention is batch-1 FP32 single forward, with one MAC equal to two FLOPs. Parameters and trainable parameters are exact. Convolution and linear operations are hook-counted consistently; latency is a warm-start median and CUDA peak memory is reported when applicable.
+Profiles report architecture version, input/output shapes, all physical stage shapes, coordinate state, prior-anchor count, temporal rank, parameters, trainable parameters, GMACs/GFLOPs, batch-1 latency, and CUDA peak allocated memory.
 
-Formal result summaries should state method, domain, seed, source commit, checkpoint hash, prior hash, validation/test status, linear NMSE, dB conversion, parameter counts, device, and wall-clock time. Smoke results are labeled `smoke_test` and must never be presented as formal performance.
+V3.0 rows remain preserved as legacy provenance and are not mixed into V3.1 validation tables.

@@ -6,18 +6,15 @@ from dataclasses import asdict, dataclass
 
 
 MODEL_DISPLAY_NAME = "PriST-RIS"
+ARCHITECTURE_VERSION = "3.1"
 MODEL_KEYS = (
     "prist_ris_a",
     "prist_ris_b",
     "prist_ris_c",
     "prist_ris_full",
 )
-MODEL_ALIASES = {
-    "v3_a_structured_progressive": "prist_ris_a",
-    "v3_b_prior_guided": "prist_ris_b",
-    "v3_c_prior_crossattn": "prist_ris_c",
-    "v3_full": "prist_ris_full",
-}
+# V3.0 aliases are intentionally not accepted: C/Full changed semantics in 3.1.
+MODEL_ALIASES: dict[str, str] = {}
 OBSERVED_RIS_INDICES = tuple(range(0, 256, 8))
 GRID_HEIGHT = GRID_WIDTH = 16
 ANTENNAS = 64
