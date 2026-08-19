@@ -1,6 +1,6 @@
 # V3.1 development protocol
 
-Development is validation-only and writes new artifacts under `runs/v3_1_dev/` or names prefixed `v31_`. Existing `runs/v3_dev/`, Ridge files, checkpoints, and V3.0 diagnostics are not deleted or overwritten.
+Development is validation-only and writes new Mobility artifacts under `runs/v3_1_q0q3_dev/` or names prefixed `v31_q0q3_`. Existing pre-fix V3.1 runs, Ridge files, checkpoints, and diagnostics are not deleted or overwritten.
 
 Sequence:
 

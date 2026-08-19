@@ -39,7 +39,7 @@ export PRIST_RIS_DATA_ROOT=/root/autodl-tmp/lpan
 
 prist-ris audit \
   --data-root "$PRIST_RIS_DATA_ROOT" \
-  --output reports/generated/v31_data_audit.json
+  --output reports/generated/v31_q0q3_data_audit.json
 
 prist-ris fit-prior \
   --domain mobility \
