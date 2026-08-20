@@ -8,7 +8,8 @@ from dataclasses import asdict, dataclass
 MODEL_DISPLAY_NAME = "PriST-RIS"
 ARCHITECTURE_VERSION = "3.2"
 MOBILITY_CONTRACT_VERSION = "mobility_q0_q3_v1"
-SPATIAL_PROTOCOL_VERSION = "physical_stable_residual_v2"
+SPATIAL_PROTOCOL_VERSION = "physical_stable_residual_position_v3"
+POSITION_SEMANTICS_VERSION = "physical_ris_decoupled_v1"
 MODEL_KEYS = (
     "prist_ris_a",
     "prist_ris_b",

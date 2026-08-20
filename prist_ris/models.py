@@ -14,6 +14,7 @@ from .contracts import (
     MOBILITY_CONTRACT_VERSION,
     MODEL_DISPLAY_NAME,
     OBSERVED_RIS_INDICES,
+    POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
     canonical_model_key,
 )
@@ -26,6 +27,7 @@ PHYSICAL_STAGE_COLUMNS: dict[int, tuple[int, ...]] = {
     16: tuple(range(16)),
 }
 SPATIAL_RESIDUAL_STYLES = ("post_activation", "scaled_true_residual")
+BACKBONE_RIS_COORDINATE_MODES = ("off", "direct_add", "zero_init_gated")
 OBSERVED_DENSE_ATTENTION_HEADS = 4
 OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE = 0.1
 
@@ -216,18 +218,42 @@ class PhysicalGridBackbone(nn.Module):
         blocks_per_stage: tuple[int, int, int] = (3, 3, 4),
         final_refine_blocks: int = 4,
         *,
-        coordinate_enabled: bool,
+        ris_coordinate_enabled: bool = False,
+        antenna_index_enabled: bool = False,
+        ris_coordinate_mode: str = "off",
         residual_style: str = "scaled_true_residual",
     ) -> None:
         super().__init__()
         if len(blocks_per_stage) != 3 or final_refine_blocks < 1:
             raise ValueError("PriST-RIS V3.2 requires three progressive stages and final refinement.")
+        if ris_coordinate_mode not in BACKBONE_RIS_COORDINATE_MODES:
+            raise ValueError(
+                f"ris_coordinate_mode must be one of {BACKBONE_RIS_COORDINATE_MODES}."
+            )
+        if ris_coordinate_enabled != (ris_coordinate_mode != "off"):
+            raise ValueError(
+                "RIS coordinate enablement and injection mode must agree."
+            )
         self.hidden = hidden
-        self.coordinate_enabled = coordinate_enabled
+        self.ris_coordinate_enabled = ris_coordinate_enabled
+        self.antenna_index_enabled = antenna_index_enabled
+        self.ris_coordinate_mode = ris_coordinate_mode
         self.residual_style = residual_style
         self.input = nn.Conv3d(4, hidden, 3, padding=1)
-        self.ris_coordinate_encoder = RISCoordinateEncoder(hidden) if coordinate_enabled else None
-        self.antenna_index_encoder = AntennaIndexEncoder(hidden) if coordinate_enabled else None
+        # Optional position modules must not perturb the initialization of the
+        # stable B path when a zero-init gate is added for an ablation.
+        with torch.random.fork_rng(devices=[]):
+            self.ris_coordinate_encoder = (
+                RISCoordinateEncoder(hidden) if ris_coordinate_enabled else None
+            )
+            self.antenna_index_encoder = (
+                AntennaIndexEncoder(hidden) if antenna_index_enabled else None
+            )
+        self.ris_coordinate_gates = (
+            nn.Parameter(torch.zeros(4))
+            if ris_coordinate_mode == "zero_init_gated"
+            else None
+        )
         self.stages = nn.ModuleList(
             PhysicalProgressiveStage(hidden, blocks, residual_style)
             for blocks in blocks_per_stage
@@ -239,23 +265,29 @@ class PhysicalGridBackbone(nn.Module):
             )
         )
 
-    def _coordinates(self, value: torch.Tensor) -> torch.Tensor:
-        if self.ris_coordinate_encoder is None or self.antenna_index_encoder is None:
-            return torch.zeros_like(value)
-        return self.ris_coordinate_encoder(value) + self.antenna_index_encoder(value)
+    def _position_features(self, value: torch.Tensor, stage_index: int) -> torch.Tensor:
+        result = torch.zeros_like(value)
+        if self.ris_coordinate_encoder is not None:
+            ris = self.ris_coordinate_encoder(value)
+            if self.ris_coordinate_gates is not None:
+                ris = self.ris_coordinate_gates[stage_index] * ris
+            result = result + ris
+        if self.antenna_index_encoder is not None:
+            result = result + self.antenna_index_encoder(value)
+        return result
 
     def forward(
         self, observations: torch.Tensor, obs_ris_index: torch.Tensor
     ) -> tuple[torch.Tensor, list[tuple[int, ...]]]:
         grid = observations_to_physical_grid(observations, obs_ris_index)
         value = self.input(grid)
-        if self.coordinate_enabled:
-            value = value + self._coordinates(value)
+        if self.ris_coordinate_enabled or self.antenna_index_enabled:
+            value = value + self._position_features(value, 0)
         shapes = [tuple(value.shape)]
-        for stage in self.stages:
+        for stage_index, stage in enumerate(self.stages, start=1):
             value = stage(value)
-            if self.coordinate_enabled:
-                value = value + self._coordinates(value)
+            if self.ris_coordinate_enabled or self.antenna_index_enabled:
+                value = value + self._position_features(value, stage_index)
             shapes.append(tuple(value.shape))
         value = self.final_refine(value)
         if value.shape[2:] != (ANTENNAS, 16, 16):
@@ -272,7 +304,8 @@ class PhysicalObservedDenseResidualAttention(nn.Module):
         heads: int = OBSERVED_DENSE_ATTENTION_HEADS,
         *,
         residual_scale: float = OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE,
-        coordinate_enabled: bool = True,
+        ris_coordinate_enabled: bool = True,
+        antenna_index_enabled: bool = True,
     ) -> None:
         super().__init__()
         if hidden % heads != 0:
@@ -283,15 +316,22 @@ class PhysicalObservedDenseResidualAttention(nn.Module):
         self.heads = heads
         self.head_width = hidden // heads
         self.residual_scale = float(residual_scale)
-        self.coordinate_enabled = coordinate_enabled
+        self.ris_coordinate_enabled = ris_coordinate_enabled
+        self.antenna_index_enabled = antenna_index_enabled
         self.pilot_token_projection = nn.Sequential(
             nn.Linear(4, hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
         )
-        self.observed_coordinate_projection = nn.Linear(2, hidden)
-        self.dense_coordinate_projection = nn.Linear(2, hidden)
-        self.antenna_projection = nn.Linear(1, hidden)
+        self.observed_coordinate_projection = (
+            nn.Linear(2, hidden) if ris_coordinate_enabled else None
+        )
+        self.dense_coordinate_projection = (
+            nn.Linear(2, hidden) if ris_coordinate_enabled else None
+        )
+        self.antenna_projection = (
+            nn.Linear(1, hidden) if antenna_index_enabled else None
+        )
         self.observed_norm = nn.LayerNorm(hidden)
         self.query_norm = nn.LayerNorm(hidden)
         self.query_projection = nn.Linear(hidden, hidden)
@@ -353,36 +393,37 @@ class PhysicalObservedDenseResidualAttention(nn.Module):
         descriptors = descriptors[:, None, None].expand(-1, ANTENNAS, 32, -1, -1)
         pilot_inputs = torch.cat((values, descriptors), dim=-1)
         tokens = self.pilot_token_projection(pilot_inputs).sum(dim=3) / (times ** 0.5)
-        if self.coordinate_enabled:
+        if self.observed_coordinate_projection is not None:
             observed_coordinates = self.observed_coordinates(
                 obs_ris_index, batch_size, dtype=observations.dtype
             )
+            tokens = tokens + self.observed_coordinate_projection(
+                observed_coordinates
+            )[None, None]
+        if self.antenna_projection is not None:
             antenna_coordinates = self.antenna_coordinates(
                 device=observations.device, dtype=observations.dtype
             )
-            tokens = (
-                tokens
-                + self.observed_coordinate_projection(observed_coordinates)[None, None]
-                + self.antenna_projection(antenna_coordinates)[None, :, None]
-            )
+            tokens = tokens + self.antenna_projection(antenna_coordinates)[None, :, None]
         return self.observed_norm(tokens).reshape(batch_size * ANTENNAS, 32, self.hidden)
 
     def _dense_queries(self, features: torch.Tensor) -> torch.Tensor:
         batch_size = features.shape[0]
         queries = features.permute(0, 2, 3, 4, 1)
-        if self.coordinate_enabled:
+        if self.dense_coordinate_projection is not None:
             dense_coordinates = self.dense_coordinates(
                 device=features.device, dtype=features.dtype
             )
+            queries = queries + self.dense_coordinate_projection(dense_coordinates)[
+                None, None
+            ].reshape(1, 1, 16, 16, self.hidden)
+        if self.antenna_projection is not None:
             antenna_coordinates = self.antenna_coordinates(
                 device=features.device, dtype=features.dtype
             )
-            queries = (
-                queries
-                + self.dense_coordinate_projection(dense_coordinates)[None, None]
-                .reshape(1, 1, 16, 16, self.hidden)
-                + self.antenna_projection(antenna_coordinates)[None, :, None, None]
-            )
+            queries = queries + self.antenna_projection(antenna_coordinates)[
+                None, :, None, None
+            ]
         return self.query_norm(queries).reshape(batch_size * ANTENNAS, 256, self.hidden)
 
     def _heads(self, value: torch.Tensor) -> torch.Tensor:
@@ -556,12 +597,21 @@ class PriSTRISConfig:
     final_refine_blocks: int = 4
     temporal_rank: int = 2
     temporal_residual: bool = True
+    # Deprecated compatibility alias. New experiments must use the explicit
+    # position flags below.
     coordinate_enabled: bool | None = None
+    backbone_ris_coordinate_enabled: bool | None = None
+    backbone_antenna_index_enabled: bool | None = None
+    backbone_ris_coordinate_mode: str | None = None
+    attention_enabled: bool | None = None
+    attention_ris_coordinate_enabled: bool | None = None
+    attention_antenna_index_enabled: bool | None = None
     observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS
     spatial_residual_style: str = "scaled_true_residual"
     temporal_mode: str = "trend"
     architecture_version: str = ARCHITECTURE_VERSION
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
+    position_semantics_version: str = POSITION_SEMANTICS_VERSION
 
 
 class PriSTRIS(nn.Module):
@@ -576,14 +626,90 @@ class PriSTRIS(nn.Module):
             raise ValueError("domain must be quasi or mobility.")
         if config.spatial_protocol_version != SPATIAL_PROTOCOL_VERSION:
             raise ValueError("PriST-RIS spatial protocol version mismatch.")
-        coordinate_enabled = (
-            key in {"prist_ris_c", "prist_ris_full"}
-            if config.coordinate_enabled is None
-            else config.coordinate_enabled
+        if config.position_semantics_version != POSITION_SEMANTICS_VERSION:
+            raise ValueError("PriST-RIS position semantics version mismatch.")
+        explicit_position = (
+            config.backbone_ris_coordinate_enabled,
+            config.backbone_antenna_index_enabled,
+            config.backbone_ris_coordinate_mode,
+            config.attention_ris_coordinate_enabled,
+            config.attention_antenna_index_enabled,
         )
+        if config.coordinate_enabled is not None and any(
+            value is not None for value in explicit_position
+        ):
+            raise ValueError(
+                "The legacy coordinate_enabled alias cannot be combined with explicit position flags."
+            )
+        legacy_coordinate_alias_used = config.coordinate_enabled is not None
+        default_coupled = key in {"prist_ris_c", "prist_ris_full"}
+        attention_enabled = (
+            default_coupled
+            if config.attention_enabled is None
+            else config.attention_enabled
+        )
+        if legacy_coordinate_alias_used:
+            backbone_ris_coordinate_enabled = bool(config.coordinate_enabled)
+            backbone_antenna_index_enabled = bool(config.coordinate_enabled)
+            attention_ris_coordinate_enabled = bool(config.coordinate_enabled) and attention_enabled
+            attention_antenna_index_enabled = bool(config.coordinate_enabled) and attention_enabled
+            backbone_ris_coordinate_mode = (
+                "direct_add" if backbone_ris_coordinate_enabled else "off"
+            )
+        else:
+            backbone_ris_coordinate_enabled = (
+                default_coupled
+                if config.backbone_ris_coordinate_enabled is None
+                else config.backbone_ris_coordinate_enabled
+            )
+            backbone_antenna_index_enabled = (
+                default_coupled
+                if config.backbone_antenna_index_enabled is None
+                else config.backbone_antenna_index_enabled
+            )
+            attention_default = default_coupled and attention_enabled
+            attention_ris_coordinate_enabled = (
+                attention_default
+                if config.attention_ris_coordinate_enabled is None
+                else config.attention_ris_coordinate_enabled
+            )
+            attention_antenna_index_enabled = (
+                attention_default
+                if config.attention_antenna_index_enabled is None
+                else config.attention_antenna_index_enabled
+            )
+            backbone_ris_coordinate_mode = config.backbone_ris_coordinate_mode or (
+                "direct_add" if backbone_ris_coordinate_enabled else "off"
+            )
+        if backbone_ris_coordinate_enabled != (
+            backbone_ris_coordinate_mode != "off"
+        ):
+            raise ValueError(
+                "backbone RIS coordinate enablement and mode must agree."
+            )
+        if not attention_enabled and (
+            attention_ris_coordinate_enabled or attention_antenna_index_enabled
+        ):
+            raise ValueError(
+                "Attention position features require attention_enabled=True."
+            )
         self.config = PriSTRISConfig(
-            **{**asdict(config), "model_key": key, "coordinate_enabled": coordinate_enabled}
+            **{
+                **asdict(config),
+                "model_key": key,
+                # Persist a reload-safe resolved config. Alias provenance is
+                # recorded separately in protocol/checkpoint metadata.
+                "coordinate_enabled": None,
+                "backbone_ris_coordinate_enabled": backbone_ris_coordinate_enabled,
+                "backbone_antenna_index_enabled": backbone_antenna_index_enabled,
+                "backbone_ris_coordinate_mode": backbone_ris_coordinate_mode,
+                "attention_enabled": attention_enabled,
+                "attention_ris_coordinate_enabled": attention_ris_coordinate_enabled,
+                "attention_antenna_index_enabled": attention_antenna_index_enabled,
+            }
         )
+        self.legacy_coordinate_alias_used = legacy_coordinate_alias_used
+        self.legacy_coordinate_alias_value = config.coordinate_enabled
         self.anchor_count = 1 if config.domain == "quasi" else 2
         semantics = DataSemantics.for_domain(config.domain)
         self.spatial_anchor_time_index = semantics.obs_time_index
@@ -593,12 +719,14 @@ class PriSTRIS(nn.Module):
             else semantics.obs_time_index
         )
         self.uses_prior = key in {"prist_ris_b", "prist_ris_c", "prist_ris_full"}
-        self.uses_observed_dense_attention = key in {"prist_ris_c", "prist_ris_full"}
+        self.uses_observed_dense_attention = attention_enabled
         self.backbone = PhysicalGridBackbone(
             config.hidden,
             config.blocks_per_stage,
             config.final_refine_blocks,
-            coordinate_enabled=coordinate_enabled,
+            ris_coordinate_enabled=backbone_ris_coordinate_enabled,
+            antenna_index_enabled=backbone_antenna_index_enabled,
+            ris_coordinate_mode=backbone_ris_coordinate_mode,
             residual_style=config.spatial_residual_style,
         )
         self.prior_encoder = nn.Conv3d(2, config.hidden, 1) if self.uses_prior else None
@@ -606,7 +734,8 @@ class PriSTRIS(nn.Module):
             PhysicalObservedDenseResidualAttention(
                 config.hidden,
                 config.observed_dense_attention_heads,
-                coordinate_enabled=coordinate_enabled,
+                ris_coordinate_enabled=attention_ris_coordinate_enabled,
+                antenna_index_enabled=attention_antenna_index_enabled,
             )
             if self.uses_observed_dense_attention
             else None
@@ -752,7 +881,15 @@ class PriSTRIS(nn.Module):
             "prior_anchors": self.anchor_count if self.uses_prior else 0,
             "spatial_anchor_time_index": list(self.spatial_anchor_time_index),
             "output_time_index": list(self.output_time_index),
-            "coordinate_enabled": self.config.coordinate_enabled,
+            "coordinate_enabled": self.legacy_coordinate_alias_value,
+            "legacy_coordinate_alias_used": self.legacy_coordinate_alias_used,
+            "backbone_ris_coordinate_enabled": self.config.backbone_ris_coordinate_enabled,
+            "backbone_antenna_index_enabled": self.config.backbone_antenna_index_enabled,
+            "backbone_ris_coordinate_mode": self.config.backbone_ris_coordinate_mode,
+            "attention_enabled": self.config.attention_enabled,
+            "attention_ris_coordinate_enabled": self.config.attention_ris_coordinate_enabled,
+            "attention_antenna_index_enabled": self.config.attention_antenna_index_enabled,
+            "position_semantics_version": POSITION_SEMANTICS_VERSION,
             "antenna_encoding_semantics": "antenna_index_encoding",
             "spatial_residual_style": self.config.spatial_residual_style,
             "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
@@ -800,11 +937,18 @@ def build_model(
     temporal_rank: int = 2,
     temporal_residual: bool = True,
     coordinate_enabled: bool | None = None,
+    backbone_ris_coordinate_enabled: bool | None = None,
+    backbone_antenna_index_enabled: bool | None = None,
+    backbone_ris_coordinate_mode: str | None = None,
+    attention_enabled: bool | None = None,
+    attention_ris_coordinate_enabled: bool | None = None,
+    attention_antenna_index_enabled: bool | None = None,
     observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS,
     spatial_residual_style: str = "scaled_true_residual",
     temporal_mode: str = "trend",
     architecture_version: str = ARCHITECTURE_VERSION,
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION,
+    position_semantics_version: str = POSITION_SEMANTICS_VERSION,
 ) -> PriSTRIS:
     return PriSTRIS(
         PriSTRISConfig(
@@ -816,11 +960,18 @@ def build_model(
             temporal_rank=temporal_rank,
             temporal_residual=temporal_residual,
             coordinate_enabled=coordinate_enabled,
+            backbone_ris_coordinate_enabled=backbone_ris_coordinate_enabled,
+            backbone_antenna_index_enabled=backbone_antenna_index_enabled,
+            backbone_ris_coordinate_mode=backbone_ris_coordinate_mode,
+            attention_enabled=attention_enabled,
+            attention_ris_coordinate_enabled=attention_ris_coordinate_enabled,
+            attention_antenna_index_enabled=attention_antenna_index_enabled,
             observed_dense_attention_heads=observed_dense_attention_heads,
             spatial_residual_style=spatial_residual_style,
             temporal_mode=temporal_mode,
             architecture_version=architecture_version,
             spatial_protocol_version=spatial_protocol_version,
+            position_semantics_version=position_semantics_version,
         )
     )
 

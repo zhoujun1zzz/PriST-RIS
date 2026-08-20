@@ -7,7 +7,12 @@ import torch
 from torch import nn
 
 from .models import PriSTRIS, canonical_batch
-from .contracts import ARCHITECTURE_VERSION, MOBILITY_CONTRACT_VERSION, SPATIAL_PROTOCOL_VERSION
+from .contracts import (
+    ARCHITECTURE_VERSION,
+    MOBILITY_CONTRACT_VERSION,
+    POSITION_SEMANTICS_VERSION,
+    SPATIAL_PROTOCOL_VERSION,
+)
 
 
 @torch.no_grad()
@@ -73,12 +78,20 @@ def profile_model(
             MOBILITY_CONTRACT_VERSION if domain == "mobility" else None
         ),
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "model_key": model.config.model_key,
         "domain": domain,
         "input_shape": list(batch["obs_h"].shape),
         "output_shape": list(output.shape),
         "stage_shapes": [list(shape) for shape in model.last_stage_shapes],
-        "coordinate_enabled": model.config.coordinate_enabled,
+        "coordinate_enabled": model.legacy_coordinate_alias_value,
+        "legacy_coordinate_alias_used": model.legacy_coordinate_alias_used,
+        "backbone_ris_coordinate_enabled": model.config.backbone_ris_coordinate_enabled,
+        "backbone_antenna_index_enabled": model.config.backbone_antenna_index_enabled,
+        "backbone_ris_coordinate_mode": model.config.backbone_ris_coordinate_mode,
+        "attention_enabled": model.config.attention_enabled,
+        "attention_ris_coordinate_enabled": model.config.attention_ris_coordinate_enabled,
+        "attention_antenna_index_enabled": model.config.attention_antenna_index_enabled,
         "observed_dense_attention": model.uses_observed_dense_attention,
         "observed_dense_attention_heads": (
             model.config.observed_dense_attention_heads

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from prist_ris.cli import parser
+from prist_ris.contracts import SPATIAL_PROTOCOL_VERSION
 from prist_ris.screening import (
     SPATIAL_SCREENING_CANDIDATES,
     accuracy_complexity_pareto,
@@ -45,7 +46,9 @@ def test_s1_training_command_is_fixed_validation_only_and_stops_at_30() -> None:
     assert rendered[rendered.index("--epochs") + 1] == "30"
     assert rendered[rendered.index("--stop-after-epoch") + 1] == "30"
     assert rendered[rendered.index("--target-blocks") + 1] == "0,3"
-    assert "--no-coordinate-enabled" in rendered
+    assert "--no-backbone-ris-coordinate-enabled" in rendered
+    assert "--no-backbone-antenna-index-enabled" in rendered
+    assert "--no-attention-enabled" in rendered
     assert "test" not in rendered
     assert "--amp" not in rendered
 
@@ -83,7 +86,7 @@ def test_screening_summary_reads_best_epoch_late_trend_and_profile(tmp_path: Pat
         json.dumps(
             {
                 "architecture_version": "3.2",
-                "spatial_protocol_version": "physical_stable_residual_v2",
+                "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
                 "best_validation_nmse_db": -19.4,
                 "last_validation": {"nmse_db": -19.35},
                 "wall_clock_seconds": 120.0,
@@ -149,6 +152,13 @@ def test_screening_summary_reads_best_epoch_late_trend_and_profile(tmp_path: Pat
 
 def test_cli_exposes_spatial_screen_without_enabling_execution() -> None:
     args = parser().parse_args(["screen-spatial", "--data-root", "data"])
+    assert args.execute is False
+    assert args.summarize_only is False
+    assert args.physical_gpu_index == 3
+
+
+def test_cli_exposes_position_screen_without_enabling_execution() -> None:
+    args = parser().parse_args(["screen-position", "--data-root", "data"])
     assert args.execute is False
     assert args.summarize_only is False
     assert args.physical_gpu_index == 3

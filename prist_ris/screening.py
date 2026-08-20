@@ -12,6 +12,7 @@ from .checkpoint import load_checkpoint
 from .contracts import (
     ARCHITECTURE_VERSION,
     MOBILITY_CONTRACT_VERSION,
+    POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
 )
 
@@ -32,12 +33,29 @@ SPATIAL_SCREENING_CANDIDATES = (
 )
 
 
+@dataclass(frozen=True)
+class PositionScreeningCandidate:
+    name: str
+    backbone_ris_coordinate_enabled: bool
+    backbone_ris_coordinate_mode: str
+    attention_enabled: bool
+    attention_ris_coordinate_enabled: bool
+
+
+POSITION_SCREENING_CANDIDATES = (
+    PositionScreeningCandidate("P1_ris_direct", True, "direct_add", False, False),
+    PositionScreeningCandidate("P2_ris_gated", True, "zero_init_gated", False, False),
+    PositionScreeningCandidate("P3_attention_ris", False, "off", True, True),
+)
+
+
 def spatial_screening_plan(seed: int = 123) -> dict[str, object]:
     return {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
         "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "phase": "S1_capacity_depth_pareto",
         "research_question": (
             "Which width/depth candidate improves the validation-NMSE versus "
@@ -64,7 +82,12 @@ def spatial_screening_plan(seed: int = 123) -> dict[str, object]:
             "epochs": 30,
             "stop_after_epoch": 30,
             "target_blocks": [0, 3],
-            "coordinate_enabled": False,
+            "backbone_ris_coordinate_enabled": False,
+            "backbone_antenna_index_enabled": False,
+            "backbone_ris_coordinate_mode": "off",
+            "attention_enabled": False,
+            "attention_ris_coordinate_enabled": False,
+            "attention_antenna_index_enabled": False,
             "observed_dense_attention": False,
             "amp": False,
             "scheduler": None,
@@ -132,13 +155,95 @@ def spatial_candidate_training_arguments(
         15,
         "--target-blocks",
         "0,3",
-        "--no-coordinate-enabled",
+        "--no-backbone-ris-coordinate-enabled",
+        "--no-backbone-antenna-index-enabled",
+        "--backbone-ris-coordinate-mode",
+        "off",
+        "--no-attention-enabled",
+        "--no-attention-ris-coordinate-enabled",
+        "--no-attention-antenna-index-enabled",
         "--stop-after-epoch",
         30,
         "--run-name",
         candidate.name,
         "--output-root",
         output_root,
+    ]
+
+
+def position_screening_plan(seed: int = 123) -> dict[str, object]:
+    """Return the fixed, factor-isolated P1-P3 Mobility validation plan."""
+
+    return {
+        "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
+        "phase": "position_semantics_repair_p1_p3",
+        "fixed_protocol": {
+            "domain": "mobility",
+            "model": "prist_ris_b",
+            "mode": "dev",
+            "seed": seed,
+            "train_samples": 4096,
+            "validation_samples": 1800,
+            "batch_size": 32,
+            "eval_batch_size": 64,
+            "learning_rate": 5e-4,
+            "weight_decay": 1e-5,
+            "epochs": 30,
+            "stop_after_epoch": 30,
+            "target_blocks": [0, 3],
+            "backbone_antenna_index_enabled": False,
+            "attention_antenna_index_enabled": False,
+            "selection_split": "validation",
+            "test_split_used": False,
+            "serial_execution": True,
+        },
+        "candidates": [asdict(candidate) for candidate in POSITION_SCREENING_CANDIDATES],
+        "p4_scheduled": False,
+        "canonical_changed": False,
+    }
+
+
+def position_candidate_training_arguments(
+    candidate: PositionScreeningCandidate,
+    *,
+    prior: str | Path,
+    data_root: str | Path,
+    output_root: str | Path,
+    device: str = "cuda",
+    workers: int = 8,
+    seed: int = 123,
+) -> list[object]:
+    """Build one fixed 30-epoch P1-P3 command without coupled position flags."""
+
+    return [
+        "train", "--domain", "mobility", "--model", "prist_ris_b",
+        "--mode", "dev", "--seed", seed, "--prior", prior,
+        "--data-root", data_root, "--device", device, "--workers", workers,
+        "--batch-size", 32, "--eval-batch-size", 64,
+        "--learning-rate", 5e-4, "--weight-decay", 1e-5,
+        "--epochs", 30, "--min-epochs", 31, "--patience", 15,
+        "--target-blocks", "0,3",
+        (
+            "--backbone-ris-coordinate-enabled"
+            if candidate.backbone_ris_coordinate_enabled
+            else "--no-backbone-ris-coordinate-enabled"
+        ),
+        "--no-backbone-antenna-index-enabled",
+        "--backbone-ris-coordinate-mode", candidate.backbone_ris_coordinate_mode,
+        "--attention-enabled" if candidate.attention_enabled else "--no-attention-enabled",
+        (
+            "--attention-ris-coordinate-enabled"
+            if candidate.attention_ris_coordinate_enabled
+            else "--no-attention-ris-coordinate-enabled"
+        ),
+        "--no-attention-antenna-index-enabled",
+        "--stop-after-epoch", 30,
+        "--run-name", candidate.name,
+        "--output-root", output_root,
     ]
 
 
@@ -212,6 +317,21 @@ def _run_summary(
         "run_dir": str(run_dir.resolve()),
         "architecture_version": final.get("architecture_version"),
         "spatial_protocol_version": final.get("spatial_protocol_version"),
+        "position_semantics_version": final.get("position_semantics_version"),
+        "backbone_ris_coordinate_enabled": final.get(
+            "backbone_ris_coordinate_enabled"
+        ),
+        "backbone_antenna_index_enabled": final.get(
+            "backbone_antenna_index_enabled"
+        ),
+        "backbone_ris_coordinate_mode": final.get("backbone_ris_coordinate_mode"),
+        "attention_enabled": final.get("attention_enabled"),
+        "attention_ris_coordinate_enabled": final.get(
+            "attention_ris_coordinate_enabled"
+        ),
+        "attention_antenna_index_enabled": final.get(
+            "attention_antenna_index_enabled"
+        ),
         "seed": config.get("seed"),
         "hidden": config.get("hidden"),
         "blocks_per_stage": config.get("blocks_per_stage"),
@@ -282,11 +402,39 @@ def summarize_spatial_screening(
     return {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "phase": "S1_capacity_depth_pareto",
         "selection_split": "validation",
         "test_split_used": False,
         "rows": rows,
         "accuracy_gmac_pareto_frontier": accuracy_complexity_pareto(rows),
         "missing_candidates": missing,
+        "canonical_changed": False,
+    }
+
+
+def summarize_position_screening(study_root: str | Path) -> dict[str, object]:
+    root = Path(study_root)
+    rows: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for candidate in POSITION_SCREENING_CANDIDATES:
+        run_dir = root / "runs" / candidate.name
+        profile = root / "profiles" / f"{candidate.name}.json"
+        if (run_dir / "results" / "final_result.json").is_file():
+            rows.append(_run_summary(candidate.name, run_dir, profile))
+        else:
+            missing.append(candidate.name)
+    return {
+        "method": "PriST-RIS",
+        "architecture_version": ARCHITECTURE_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
+        "phase": "position_semantics_repair_p1_p3",
+        "selection_split": "validation",
+        "test_split_used": False,
+        "rows": rows,
+        "missing_candidates": missing,
+        "p4_scheduled": False,
         "canonical_changed": False,
     }

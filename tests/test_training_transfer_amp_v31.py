@@ -10,6 +10,7 @@ from prist_ris.checkpoint import load_checkpoint
 from prist_ris.contracts import (
     ARCHITECTURE_VERSION,
     OBSERVED_RIS_INDICES,
+    POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
     DataSemantics,
 )
@@ -73,10 +74,25 @@ def test_checkpoint_contains_v32_reproducibility_contract(tmp_path: Path) -> Non
     state = load_checkpoint(run / "checkpoints" / "last_checkpoint.pth", torch.device("cpu"))
     assert state["architecture_version"] == ARCHITECTURE_VERSION
     assert state["model_config"]["architecture_version"] == ARCHITECTURE_VERSION
+    assert state["position_semantics_version"] == POSITION_SEMANTICS_VERSION
+    for key in (
+        "backbone_ris_coordinate_enabled",
+        "backbone_antenna_index_enabled",
+        "backbone_ris_coordinate_mode",
+        "attention_enabled",
+        "attention_ris_coordinate_enabled",
+        "attention_antenna_index_enabled",
+    ):
+        assert state[key] is not None
+        assert state["training_config"][key] is not None
+        assert state["model_config"][key] is not None
     assert state["rng_state"] and state["train_loader_generator_state"] is not None
     metadata = (run / "metadata.json").read_text(encoding="utf-8")
     assert f'"architecture_version": "{ARCHITECTURE_VERSION}"' in metadata
+    assert f'"position_semantics_version": "{POSITION_SEMANTICS_VERSION}"' in metadata
     assert '"test_split_used": false' in metadata
+    final = (run / "results" / "final_result.json").read_text(encoding="utf-8")
+    assert f'"position_semantics_version": "{POSITION_SEMANTICS_VERSION}"' in final
 
 
 def test_resume_is_bitwise_deterministic(tmp_path: Path) -> None:
@@ -155,6 +171,7 @@ def test_spatial_transfer_loads_only_compatible_weights() -> None:
     state = {
         "architecture_version": ARCHITECTURE_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "model_config": {"domain": "quasi", "model_key": "prist_ris_c"},
         "model_state": source.state_dict(),
     }
@@ -214,6 +231,7 @@ def test_quasi_a_backbone_transfer_remains_compatible() -> None:
         {
             "architecture_version": ARCHITECTURE_VERSION,
             "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+            "position_semantics_version": POSITION_SEMANTICS_VERSION,
             "model_config": {"domain": "quasi", "model_key": "prist_ris_a"},
             "model_state": source.state_dict(),
         },
@@ -278,6 +296,7 @@ def test_prefix_mobility_checkpoint_is_rejected_by_contract_guard() -> None:
     old_state = {
         "architecture_version": ARCHITECTURE_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "model_config": {"domain": "mobility"},
         "semantics_hash": semantics.stable_hash(),
         "data_semantics": semantics.to_dict(),
@@ -307,6 +326,7 @@ def test_current_q0q3_attention_checkpoint_contract_is_accepted() -> None:
             "architecture_version": ARCHITECTURE_VERSION,
             "mobility_contract_version": "mobility_q0_q3_v1",
             "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+            "position_semantics_version": POSITION_SEMANTICS_VERSION,
             "model_config": {"domain": "mobility", "model_key": "prist_ris_c"},
             "semantics_hash": semantics.stable_hash(),
             "data_semantics": semantics.to_dict(),
@@ -321,6 +341,7 @@ def test_spatial_protocol_does_not_invalidate_ridge_only_model_checkpoint() -> N
     state = {
         "architecture_version": ARCHITECTURE_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "mobility_contract_version": "mobility_q0_q3_v1",
         "model_config": {"domain": "mobility", "model_key": "prist_ris_b"},
         "semantics_hash": semantics.stable_hash(),

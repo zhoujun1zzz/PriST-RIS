@@ -16,6 +16,7 @@ from .complexity import profile_model
 from .contracts import (
     ARCHITECTURE_VERSION,
     MOBILITY_CONTRACT_VERSION,
+    POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
     MODEL_ALIASES,
     MODEL_KEYS,
@@ -59,9 +60,13 @@ from .metrics import MetricAccumulator, PerQueryMetricAccumulator
 from .models import build_model
 from .prior import RidgePrior, RidgeStatistics, file_sha256
 from .screening import (
+    POSITION_SCREENING_CANDIDATES,
     SPATIAL_SCREENING_CANDIDATES,
+    position_candidate_training_arguments,
+    position_screening_plan,
     spatial_candidate_training_arguments,
     spatial_screening_plan,
+    summarize_position_screening,
     summarize_spatial_screening,
 )
 
@@ -113,6 +118,7 @@ def audit_command(args: argparse.Namespace) -> dict[str, object]:
         "architecture_version": ARCHITECTURE_VERSION,
         "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "test_included": "test" in splits,
         "files": rows,
     }
@@ -132,6 +138,12 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
         temporal_rank=args.temporal_rank,
         temporal_residual=not args.no_temporal_residual,
         coordinate_enabled=args.coordinate_enabled,
+        backbone_ris_coordinate_enabled=args.backbone_ris_coordinate_enabled,
+        backbone_antenna_index_enabled=args.backbone_antenna_index_enabled,
+        backbone_ris_coordinate_mode=args.backbone_ris_coordinate_mode,
+        attention_enabled=args.attention_enabled,
+        attention_ris_coordinate_enabled=args.attention_ris_coordinate_enabled,
+        attention_antenna_index_enabled=args.attention_antenna_index_enabled,
         observed_dense_attention_heads=args.observed_dense_attention_heads,
         spatial_residual_style=args.spatial_residual_style,
         temporal_mode=args.temporal_mode,
@@ -233,7 +245,12 @@ def spatial_screen_command(args: argparse.Namespace) -> dict[str, object]:
                 hidden=candidate.hidden,
                 blocks_per_stage=candidate.blocks_per_stage,
                 final_refine_blocks=candidate.final_refine_blocks,
-                coordinate_enabled=False,
+                backbone_ris_coordinate_enabled=False,
+                backbone_antenna_index_enabled=False,
+                backbone_ris_coordinate_mode="off",
+                attention_enabled=False,
+                attention_ris_coordinate_enabled=False,
+                attention_antenna_index_enabled=False,
             ).to(device)
             _json(
                 profile_path,
@@ -247,6 +264,106 @@ def spatial_screen_command(args: argparse.Namespace) -> dict[str, object]:
         reference_run=args.reference_run,
         reference_profile=args.reference_profile,
     )
+    _json(root / "summary.json", summary)
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
+def position_screen_command(args: argparse.Namespace) -> dict[str, object]:
+    """Plan, execute, or summarize the factor-isolated P1-P3 screen."""
+
+    root = Path(args.output_root) / (
+        args.study_name or f"position_semantics_p1_p3_seed{args.seed}"
+    )
+    prior_value: str | Path = args.prior if args.prior is not None else "$PRIOR"
+    plan = position_screening_plan(args.seed)
+    plan["commands"] = {
+        candidate.name: [
+            "prist-ris",
+            *(
+                str(value)
+                for value in position_candidate_training_arguments(
+                    candidate,
+                    prior=prior_value,
+                    data_root=args.data_root,
+                    output_root=root / "runs",
+                    device=args.device,
+                    workers=args.workers,
+                    seed=args.seed,
+                )
+            ),
+        ]
+        for candidate in POSITION_SCREENING_CANDIDATES
+    }
+    plan["physical_gpu_preflight"] = f"nvidia-smi -i {args.physical_gpu_index}"
+    write_plan(root / "screening_plan.json", plan)
+    if args.summarize_only:
+        summary = summarize_position_screening(root)
+        _json(root / "summary.json", summary)
+        print(json.dumps(summary, indent=2))
+        return summary
+    if not args.execute:
+        print(json.dumps(plan, indent=2))
+        return plan
+    if args.prior is None:
+        raise ValueError("Executing P1-P3 requires the fixed q0/q3 --prior artifact.")
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        if os.environ.get("CUDA_VISIBLE_DEVICES") != str(args.physical_gpu_index):
+            raise PermissionError(
+                f"Set CUDA_VISIBLE_DEVICES={args.physical_gpu_index} before executing P1-P3."
+            )
+        if not args.confirm_gpu_free:
+            raise PermissionError(
+                "Inspect the physical GPU first, then pass --confirm-gpu-free."
+            )
+    profiles = root / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    for candidate in POSITION_SCREENING_CANDIDATES:
+        run_dir = root / "runs" / candidate.name
+        final_path = run_dir / "results" / "final_result.json"
+        if final_path.is_file():
+            print(f"reuse completed position run: {run_dir}", flush=True)
+        elif run_dir.exists():
+            raise FileExistsError(
+                f"Incomplete run exists and will not be overwritten: {run_dir}"
+            )
+        else:
+            if device.type == "cuda":
+                subprocess.run(
+                    ["nvidia-smi", "-i", str(args.physical_gpu_index)], check=True
+                )
+            _invoke(
+                position_candidate_training_arguments(
+                    candidate,
+                    prior=args.prior,
+                    data_root=args.data_root,
+                    output_root=root / "runs",
+                    device=args.device,
+                    workers=args.workers,
+                    seed=args.seed,
+                ),
+                dry_run=False,
+            )
+        profile_path = profiles / f"{candidate.name}.json"
+        if not profile_path.is_file():
+            model = build_model(
+                "prist_ris_b",
+                domain="mobility",
+                backbone_ris_coordinate_enabled=candidate.backbone_ris_coordinate_enabled,
+                backbone_antenna_index_enabled=False,
+                backbone_ris_coordinate_mode=candidate.backbone_ris_coordinate_mode,
+                attention_enabled=candidate.attention_enabled,
+                attention_ris_coordinate_enabled=(
+                    candidate.attention_ris_coordinate_enabled
+                ),
+                attention_antenna_index_enabled=False,
+            ).to(device)
+            _json(profile_path, profile_model(model, domain="mobility", device=device))
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    summary = summarize_position_screening(root)
     _json(root / "summary.json", summary)
     print(json.dumps(summary, indent=2))
     return summary
@@ -380,6 +497,12 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         temporal_rank=args.temporal_rank,
         temporal_residual=not args.no_temporal_residual,
         coordinate_enabled=args.coordinate_enabled,
+        backbone_ris_coordinate_enabled=args.backbone_ris_coordinate_enabled,
+        backbone_antenna_index_enabled=args.backbone_antenna_index_enabled,
+        backbone_ris_coordinate_mode=args.backbone_ris_coordinate_mode,
+        attention_enabled=args.attention_enabled,
+        attention_ris_coordinate_enabled=args.attention_ris_coordinate_enabled,
+        attention_antenna_index_enabled=args.attention_antenna_index_enabled,
         observed_dense_attention_heads=args.observed_dense_attention_heads,
         spatial_residual_style=args.spatial_residual_style,
         temporal_mode=args.temporal_mode,
@@ -732,6 +855,8 @@ def report_command(args: argparse.Namespace) -> dict[str, object]:
     result = {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "validation_runs": rows,
         "legacy_runs_preserved": legacy_rows,
         "external_baselines": baselines,
@@ -753,7 +878,37 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
         "--coordinate-enabled",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Override canonical coordinate setting for controlled ablation.",
+        help="Deprecated compatibility alias coupling all available position paths.",
+    )
+    parser.add_argument(
+        "--backbone-ris-coordinate-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--backbone-antenna-index-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--backbone-ris-coordinate-mode",
+        choices=("off", "direct_add", "zero_init_gated"),
+        default=None,
+    )
+    parser.add_argument(
+        "--attention-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--attention-ris-coordinate-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--attention-antenna-index-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=None,
     )
     parser.add_argument("--observed-dense-attention-heads", type=int, default=4)
     parser.add_argument(
@@ -844,6 +999,21 @@ def parser() -> argparse.ArgumentParser:
         "--output-root", type=Path, default=Path("runs/spatial_screening")
     )
     screening.set_defaults(func=spatial_screen_command)
+
+    position_screening = commands.add_parser("screen-position")
+    add_runtime_arguments(position_screening)
+    position_screening.add_argument("--prior", type=Path)
+    position_screening.add_argument("--seed", type=int, default=123)
+    position_screening.add_argument("--physical-gpu-index", type=int, default=3)
+    position_screening.add_argument("--confirm-gpu-free", action="store_true")
+    position_action = position_screening.add_mutually_exclusive_group()
+    position_action.add_argument("--execute", action="store_true")
+    position_action.add_argument("--summarize-only", action="store_true")
+    position_screening.add_argument("--study-name")
+    position_screening.add_argument(
+        "--output-root", type=Path, default=Path("runs/position_screening")
+    )
+    position_screening.set_defaults(func=position_screen_command)
 
     tune = commands.add_parser("tune")
     add_runtime_arguments(tune)
