@@ -14,6 +14,7 @@ from .contracts import (
     MOBILITY_CONTRACT_VERSION,
     MODEL_DISPLAY_NAME,
     OBSERVED_RIS_INDICES,
+    SPATIAL_PROTOCOL_VERSION,
     canonical_model_key,
 )
 
@@ -24,6 +25,9 @@ PHYSICAL_STAGE_COLUMNS: dict[int, tuple[int, ...]] = {
     8: tuple(range(0, 16, 2)),
     16: tuple(range(16)),
 }
+SPATIAL_RESIDUAL_STYLES = ("post_activation", "scaled_true_residual")
+OBSERVED_DENSE_ATTENTION_HEADS = 4
+OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE = 0.1
 
 
 def _canonical_indices(obs_ris_index: torch.Tensor, batch_size: int) -> torch.Tensor:
@@ -142,8 +146,13 @@ class AntennaIndexEncoder(nn.Module):
 
 
 class StrongSpatioRISResidualBlock(nn.Module):
-    def __init__(self, hidden: int) -> None:
+    def __init__(self, hidden: int, residual_style: str = "post_activation") -> None:
         super().__init__()
+        if residual_style not in SPATIAL_RESIDUAL_STYLES:
+            raise ValueError(
+                f"residual_style must be one of {SPATIAL_RESIDUAL_STYLES}."
+            )
+        self.residual_style = residual_style
         self.body = nn.Sequential(
             nn.Conv3d(hidden, hidden, 3, padding=1),
             nn.GELU(),
@@ -152,6 +161,8 @@ class StrongSpatioRISResidualBlock(nn.Module):
         self.activation = nn.GELU()
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
+        if self.residual_style == "scaled_true_residual":
+            return value + 0.1 * F.gelu(self.body(value))
         return self.activation(value + self.body(value))
 
 
@@ -171,10 +182,12 @@ class PhysicalColumnUpsample(nn.Module):
 
 
 class PhysicalProgressiveStage(nn.Module):
-    def __init__(self, hidden: int, blocks: int) -> None:
+    def __init__(self, hidden: int, blocks: int, residual_style: str) -> None:
         super().__init__()
         self.upsample = PhysicalColumnUpsample(hidden)
-        self.blocks = nn.Sequential(*(StrongSpatioRISResidualBlock(hidden) for _ in range(blocks)))
+        self.blocks = nn.Sequential(
+            *(StrongSpatioRISResidualBlock(hidden, residual_style) for _ in range(blocks))
+        )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         return self.blocks(self.upsample(value))
@@ -188,20 +201,26 @@ class PhysicalGridBackbone(nn.Module):
         final_refine_blocks: int = 4,
         *,
         coordinate_enabled: bool,
+        residual_style: str = "post_activation",
     ) -> None:
         super().__init__()
         if len(blocks_per_stage) != 3 or final_refine_blocks < 1:
             raise ValueError("V3.1 requires three progressive stages and final refinement.")
         self.hidden = hidden
         self.coordinate_enabled = coordinate_enabled
+        self.residual_style = residual_style
         self.input = nn.Conv3d(4, hidden, 3, padding=1)
         self.ris_coordinate_encoder = RISCoordinateEncoder(hidden) if coordinate_enabled else None
         self.antenna_index_encoder = AntennaIndexEncoder(hidden) if coordinate_enabled else None
         self.stages = nn.ModuleList(
-            PhysicalProgressiveStage(hidden, blocks) for blocks in blocks_per_stage
+            PhysicalProgressiveStage(hidden, blocks, residual_style)
+            for blocks in blocks_per_stage
         )
         self.final_refine = nn.Sequential(
-            *(StrongSpatioRISResidualBlock(hidden) for _ in range(final_refine_blocks))
+            *(
+                StrongSpatioRISResidualBlock(hidden, residual_style)
+                for _ in range(final_refine_blocks)
+            )
         )
 
     def _coordinates(self, value: torch.Tensor) -> torch.Tensor:
@@ -226,6 +245,157 @@ class PhysicalGridBackbone(nn.Module):
         if value.shape[2:] != (ANTENNAS, 16, 16):
             raise RuntimeError(f"Physical backbone ended at {value.shape[2:]}, expected (64,16,16).")
         return value, shapes
+
+
+class PhysicalObservedDenseResidualAttention(nn.Module):
+    """Per-antenna 32-to-256 cross-attention over physical RIS positions."""
+
+    def __init__(
+        self,
+        hidden: int,
+        heads: int = OBSERVED_DENSE_ATTENTION_HEADS,
+        *,
+        residual_scale: float = OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE,
+        coordinate_enabled: bool = True,
+    ) -> None:
+        super().__init__()
+        if hidden % heads != 0:
+            raise ValueError("Attention hidden width must be divisible by heads.")
+        if residual_scale <= 0:
+            raise ValueError("Attention residual_scale must be positive.")
+        self.hidden = hidden
+        self.heads = heads
+        self.head_width = hidden // heads
+        self.residual_scale = float(residual_scale)
+        self.coordinate_enabled = coordinate_enabled
+        self.pilot_token_projection = nn.Sequential(
+            nn.Linear(4, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, hidden),
+        )
+        self.observed_coordinate_projection = nn.Linear(2, hidden)
+        self.dense_coordinate_projection = nn.Linear(2, hidden)
+        self.antenna_projection = nn.Linear(1, hidden)
+        self.observed_norm = nn.LayerNorm(hidden)
+        self.query_norm = nn.LayerNorm(hidden)
+        self.query_projection = nn.Linear(hidden, hidden)
+        self.key_projection = nn.Linear(hidden, hidden)
+        self.value_projection = nn.Linear(hidden, hidden)
+        self.output_projection = nn.Linear(hidden, hidden)
+
+    @staticmethod
+    def pilot_descriptors(
+        obs_time_index: torch.Tensor, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        if obs_time_index.ndim == 1:
+            obs_time_index = obs_time_index.unsqueeze(0)
+        if obs_time_index.ndim != 2 or obs_time_index.shape[1] not in {1, 2}:
+            raise ValueError("obs_time_index must have shape [T] or [B,T] for T=1|2.")
+        times = obs_time_index.to(dtype=dtype) / 3.0
+        count = obs_time_index.shape[1]
+        slots = (
+            torch.zeros(1, 1, device=obs_time_index.device, dtype=dtype)
+            if count == 1
+            else torch.tensor([-1.0, 1.0], device=obs_time_index.device, dtype=dtype).reshape(1, 2)
+        )
+        return torch.stack((times, slots.expand_as(times)), dim=-1)
+
+    @staticmethod
+    def observed_coordinates(
+        obs_ris_index: torch.Tensor, batch_size: int, *, dtype: torch.dtype
+    ) -> torch.Tensor:
+        indices = _canonical_indices(obs_ris_index, batch_size)
+        rows = torch.div(indices, 16, rounding_mode="floor").to(dtype)
+        columns = indices.remainder(16).to(dtype)
+        return torch.stack((rows * (2.0 / 15.0) - 1.0, columns * (2.0 / 15.0) - 1.0), dim=-1)
+
+    @staticmethod
+    def dense_coordinates(*, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        value = RISCoordinateEncoder.coordinates(16, device=device, dtype=dtype)
+        return value.reshape(2, 256).transpose(0, 1).contiguous()
+
+    @staticmethod
+    def antenna_coordinates(*, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        values = torch.arange(ANTENNAS, device=device, dtype=dtype)
+        return (values * (2.0 / (ANTENNAS - 1)) - 1.0).reshape(ANTENNAS, 1)
+
+    def _observed_tokens(
+        self,
+        observations: torch.Tensor,
+        obs_ris_index: torch.Tensor,
+        obs_time_index: torch.Tensor,
+    ) -> torch.Tensor:
+        if observations.ndim != 5 or observations.shape[2:] != (32, ANTENNAS, 2):
+            raise ValueError("observations must have shape [B,T,32,64,2].")
+        batch_size, times = observations.shape[:2]
+        descriptors = self.pilot_descriptors(obs_time_index, dtype=observations.dtype)
+        if descriptors.shape[0] == 1 and batch_size > 1:
+            descriptors = descriptors.expand(batch_size, -1, -1)
+        if descriptors.shape[:2] != (batch_size, times):
+            raise ValueError("obs_time_index does not match observation batch/time dimensions.")
+        values = observations.permute(0, 3, 2, 1, 4)
+        descriptors = descriptors[:, None, None].expand(-1, ANTENNAS, 32, -1, -1)
+        pilot_inputs = torch.cat((values, descriptors), dim=-1)
+        tokens = self.pilot_token_projection(pilot_inputs).sum(dim=3) / (times ** 0.5)
+        if self.coordinate_enabled:
+            observed_coordinates = self.observed_coordinates(
+                obs_ris_index, batch_size, dtype=observations.dtype
+            )
+            antenna_coordinates = self.antenna_coordinates(
+                device=observations.device, dtype=observations.dtype
+            )
+            tokens = (
+                tokens
+                + self.observed_coordinate_projection(observed_coordinates)[None, None]
+                + self.antenna_projection(antenna_coordinates)[None, :, None]
+            )
+        return self.observed_norm(tokens).reshape(batch_size * ANTENNAS, 32, self.hidden)
+
+    def _dense_queries(self, features: torch.Tensor) -> torch.Tensor:
+        batch_size = features.shape[0]
+        queries = features.permute(0, 2, 3, 4, 1)
+        if self.coordinate_enabled:
+            dense_coordinates = self.dense_coordinates(
+                device=features.device, dtype=features.dtype
+            )
+            antenna_coordinates = self.antenna_coordinates(
+                device=features.device, dtype=features.dtype
+            )
+            queries = (
+                queries
+                + self.dense_coordinate_projection(dense_coordinates)[None, None]
+                .reshape(1, 1, 16, 16, self.hidden)
+                + self.antenna_projection(antenna_coordinates)[None, :, None, None]
+            )
+        return self.query_norm(queries).reshape(batch_size * ANTENNAS, 256, self.hidden)
+
+    def _heads(self, value: torch.Tensor) -> torch.Tensor:
+        return value.reshape(value.shape[0], value.shape[1], self.heads, self.head_width).transpose(1, 2)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        observations: torch.Tensor,
+        obs_ris_index: torch.Tensor,
+        obs_time_index: torch.Tensor,
+    ) -> torch.Tensor:
+        if features.ndim != 5 or features.shape[1:] != (self.hidden, ANTENNAS, 16, 16):
+            raise ValueError("features must have shape [B,H,64,16,16].")
+        batch_size = features.shape[0]
+        queries = self._dense_queries(features)
+        observed = self._observed_tokens(observations, obs_ris_index, obs_time_index)
+        query = self._heads(self.query_projection(queries))
+        key = self._heads(self.key_projection(observed))
+        value = self._heads(self.value_projection(observed))
+        scores = torch.matmul(query, key.transpose(-2, -1)) * (self.head_width ** -0.5)
+        attention = torch.softmax(scores, dim=-1)
+        delta = torch.matmul(attention, value).transpose(1, 2).reshape(
+            batch_size * ANTENNAS, 256, self.hidden
+        )
+        delta = self.output_projection(delta).reshape(
+            batch_size, ANTENNAS, 16, 16, self.hidden
+        ).permute(0, 4, 1, 2, 3)
+        return features + self.residual_scale * delta
 
 
 def complex_factorized_reconstruction(
@@ -371,8 +541,11 @@ class PriSTRISConfig:
     temporal_rank: int = 2
     temporal_residual: bool = True
     coordinate_enabled: bool | None = None
+    observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS
+    spatial_residual_style: str = "post_activation"
     temporal_mode: str = "trend"
     architecture_version: str = ARCHITECTURE_VERSION
+    spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
 
 
 class PriSTRIS(nn.Module):
@@ -385,6 +558,8 @@ class PriSTRIS(nn.Module):
             raise ValueError("PriST-RIS model config architecture version mismatch.")
         if config.domain not in {"quasi", "mobility"}:
             raise ValueError("domain must be quasi or mobility.")
+        if config.spatial_protocol_version != SPATIAL_PROTOCOL_VERSION:
+            raise ValueError("PriST-RIS spatial protocol version mismatch.")
         coordinate_enabled = (
             key in {"prist_ris_c", "prist_ris_full"}
             if config.coordinate_enabled is None
@@ -402,13 +577,24 @@ class PriSTRIS(nn.Module):
             else semantics.obs_time_index
         )
         self.uses_prior = key in {"prist_ris_b", "prist_ris_c", "prist_ris_full"}
+        self.uses_observed_dense_attention = key in {"prist_ris_c", "prist_ris_full"}
         self.backbone = PhysicalGridBackbone(
             config.hidden,
             config.blocks_per_stage,
             config.final_refine_blocks,
             coordinate_enabled=coordinate_enabled,
+            residual_style=config.spatial_residual_style,
         )
         self.prior_encoder = nn.Conv3d(4, config.hidden, 1) if self.uses_prior else None
+        self.observed_dense_attention = (
+            PhysicalObservedDenseResidualAttention(
+                config.hidden,
+                config.observed_dense_attention_heads,
+                coordinate_enabled=coordinate_enabled,
+            )
+            if self.uses_observed_dense_attention
+            else None
+        )
         self.anchor_feature = nn.Sequential(
             nn.Conv3d(config.hidden, config.hidden, 3, padding=1), nn.GELU()
         )
@@ -447,6 +633,13 @@ class PriSTRIS(nn.Module):
                     f"{self.config.domain} V3.1 prior must contain {self.anchor_count} anchor(s)."
                 )
             features = features + self.prior_encoder(prior_to_physical_grid(prior))  # type: ignore[operator]
+        if self.observed_dense_attention is not None:
+            features = self.observed_dense_attention(
+                features,
+                batch["obs_h"],
+                batch["obs_ris_index"],
+                batch["obs_time_index"],
+            )
         anchor_features = self.anchor_feature(features)
         anchor_grids = torch.cat([head(anchor_features) for head in self.anchor_heads], dim=1)
         if self.anchor_count == 1:
@@ -504,7 +697,26 @@ class PriSTRIS(nn.Module):
             "output_time_index": list(self.output_time_index),
             "coordinate_enabled": self.config.coordinate_enabled,
             "antenna_encoding_semantics": "antenna_index_encoding",
-            "cross_attention_layers": 0,
+            "spatial_residual_style": self.config.spatial_residual_style,
+            "spatial_protocol_version": (
+                SPATIAL_PROTOCOL_VERSION if self.uses_observed_dense_attention else None
+            ),
+            "observed_dense_attention": self.uses_observed_dense_attention,
+            "observed_dense_attention_layers": 1 if self.uses_observed_dense_attention else 0,
+            "observed_dense_attention_heads": (
+                self.config.observed_dense_attention_heads
+                if self.uses_observed_dense_attention
+                else 0
+            ),
+            "observed_dense_attention_scope": (
+                "per_antenna_32_to_256" if self.uses_observed_dense_attention else None
+            ),
+            "observed_dense_attention_residual_scale": (
+                OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE
+                if self.uses_observed_dense_attention
+                else None
+            ),
+            "observed_dense_attention_uses_target": False,
             "temporal_mode": (
                 self.config.temporal_mode
                 if self.config.domain == "mobility" and self.config.model_key == "prist_ris_full"
@@ -529,8 +741,11 @@ def build_model(
     temporal_rank: int = 2,
     temporal_residual: bool = True,
     coordinate_enabled: bool | None = None,
+    observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS,
+    spatial_residual_style: str = "post_activation",
     temporal_mode: str = "trend",
     architecture_version: str = ARCHITECTURE_VERSION,
+    spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION,
 ) -> PriSTRIS:
     return PriSTRIS(
         PriSTRISConfig(
@@ -542,8 +757,11 @@ def build_model(
             temporal_rank=temporal_rank,
             temporal_residual=temporal_residual,
             coordinate_enabled=coordinate_enabled,
+            observed_dense_attention_heads=observed_dense_attention_heads,
+            spatial_residual_style=spatial_residual_style,
             temporal_mode=temporal_mode,
             architecture_version=architecture_version,
+            spatial_protocol_version=spatial_protocol_version,
         )
     )
 

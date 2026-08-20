@@ -7,7 +7,7 @@ import torch
 from torch import nn
 
 from .models import PriSTRIS, canonical_batch
-from .contracts import ARCHITECTURE_VERSION, MOBILITY_CONTRACT_VERSION
+from .contracts import ARCHITECTURE_VERSION, MOBILITY_CONTRACT_VERSION, SPATIAL_PROTOCOL_VERSION
 
 
 @torch.no_grad()
@@ -43,6 +43,9 @@ def profile_model(
     for hook in hooks:
         hook.remove()
     batch_size = int(batch["obs_h"].shape[0])
+    if model.uses_observed_dense_attention:
+        # Per-antenna QK^T and attention-value products; antennas are not flattened.
+        macs += 2 * batch_size * 64 * 256 * 32 * model.config.hidden
     if model.temporal is not None:
         queries = 4
         # One complex multiply-accumulate is counted as four real MACs.
@@ -69,12 +72,22 @@ def profile_model(
         "mobility_contract_version": (
             MOBILITY_CONTRACT_VERSION if domain == "mobility" else None
         ),
+        "spatial_protocol_version": (
+            SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
+        ),
         "model_key": model.config.model_key,
         "domain": domain,
         "input_shape": list(batch["obs_h"].shape),
         "output_shape": list(output.shape),
         "stage_shapes": [list(shape) for shape in model.last_stage_shapes],
         "coordinate_enabled": model.config.coordinate_enabled,
+        "observed_dense_attention": model.uses_observed_dense_attention,
+        "observed_dense_attention_heads": (
+            model.config.observed_dense_attention_heads
+            if model.uses_observed_dense_attention
+            else 0
+        ),
+        "spatial_residual_style": model.config.spatial_residual_style,
         "prior_anchors": model.anchor_count if model.uses_prior else 0,
         "spatial_anchor_time_index": list(model.spatial_anchor_time_index),
         "output_time_index": list(model.output_time_index),
@@ -89,6 +102,7 @@ def profile_model(
         "peak_gpu_memory_bytes": peak,
         "convention": (
             "batch1 FP32 single forward; Conv2d/Conv3d/ConvTranspose3d, linear, "
-            "and complex low-rank reconstruction; 1 real MAC=2 FLOPs"
+            "per-antenna observed-to-dense attention, and complex low-rank "
+            "reconstruction; 1 real MAC=2 FLOPs"
         ),
     }

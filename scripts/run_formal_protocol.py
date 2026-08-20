@@ -10,7 +10,7 @@ from pathlib import Path
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
-from prist_ris.contracts import MOBILITY_CONTRACT_VERSION
+from prist_ris.contracts import MOBILITY_CONTRACT_VERSION, SPATIAL_PROTOCOL_VERSION
 
 
 SEEDS = (123, 456, 789)
@@ -31,7 +31,7 @@ def main() -> None:
     parser.add_argument("--mobility-prior", required=True)
     parser.add_argument("--quasi-best-result", required=True)
     parser.add_argument("--mobility-best-result", required=True)
-    parser.add_argument("--output-root", default="runs/v3_1_q0q3_formal")
+    parser.add_argument("--output-root", default="runs/v3_1_obsdense_formal")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--quasi-batch-size", type=int, default=32)
     parser.add_argument("--dry-run", action="store_true")
@@ -43,6 +43,7 @@ def main() -> None:
         "method": "PriST-RIS",
         "architecture_version": "3.1",
         "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "fp32": True,
         "test_split_used": False,
         "stage_f_enabled": False,
@@ -60,7 +61,7 @@ def main() -> None:
     ):
         best = json.loads(Path(best_path).read_text(encoding="utf-8"))["best_hyperparameters"]
         for seed in SEEDS:
-            name = f"v31_q0q3_{domain}_prist_ris_full_seed{seed}"
+            name = f"v31_obsdense_{domain}_prist_ris_full_seed{seed}"
             run(
                 [
                     "train", "--domain", domain, "--model", "prist_ris_full",

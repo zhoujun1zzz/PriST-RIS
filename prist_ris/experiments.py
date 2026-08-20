@@ -11,7 +11,7 @@ TEMPORAL_RANKS = (2, 3)
 MECHANISM_ABLATIONS = (
     "physical_grid_spatial",
     "prior_guided_dual_anchor",
-    "coordinate_encoding",
+    "coordinate_observed_dense_attention",
     "trend_conditioned_temporal",
     "temporal_residual",
     "full",

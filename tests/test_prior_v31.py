@@ -8,8 +8,9 @@ import pytest
 import torch
 from torch.utils.data import DataLoader, Dataset
 
+from prist_ris.checkpoint import load_checkpoint
 from prist_ris.cli import parser
-from prist_ris.contracts import DataSemantics
+from prist_ris.contracts import SPATIAL_PROTOCOL_VERSION, DataSemantics
 from prist_ris.engine import TrainingConfig, train
 from prist_ris.models import canonical_batch
 from prist_ris.prior import RidgePrior, RidgeStatistics
@@ -90,3 +91,38 @@ def test_prefix_q0_q1_mobility_prior_is_rejected(tmp_path: Path) -> None:
             device=torch.device("cpu"),
             prior_path=path,
         )
+
+
+def test_q0q3_ridge_remains_reusable_for_attention_c(tmp_path: Path) -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    prior = RidgePrior(
+        coefficients=np.zeros((64, 2 * 256), dtype=np.complex128),
+        regularization=1e-3,
+        rows=1,
+        target_blocks=(0, 3),
+        semantics_hash=semantics.stable_hash(),
+    )
+    path = tmp_path / "q0q3_prior.npz"
+    prior.save(path)
+    config = TrainingConfig(
+        domain="mobility",
+        model_key="prist_ris_c",
+        mode="smoke",
+        hidden=4,
+        blocks_per_stage=(1, 1, 1),
+        final_refine_blocks=1,
+        epochs=1,
+    )
+    batch = canonical_batch("mobility")
+    run = tmp_path / "attention_c"
+    train(
+        config,
+        [batch],
+        [batch],
+        run_dir=run,
+        device=torch.device("cpu"),
+        prior_path=path,
+    )
+    state = load_checkpoint(run / "checkpoints" / "last_checkpoint.pth", torch.device("cpu"))
+    assert state["spatial_protocol_version"] == SPATIAL_PROTOCOL_VERSION
+    assert state["prior_metadata"]["target_blocks"] == [0, 3]
