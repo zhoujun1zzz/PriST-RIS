@@ -18,6 +18,7 @@ from .checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, s
 from .contracts import (
     ARCHITECTURE_VERSION,
     MOBILITY_CONTRACT_VERSION,
+    POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
     DataSemantics,
     canonical_model_key,
@@ -52,6 +53,12 @@ class TrainingConfig:
     temporal_rank: int = 2
     temporal_residual: bool = True
     coordinate_enabled: bool | None = None
+    backbone_ris_coordinate_enabled: bool | None = None
+    backbone_antenna_index_enabled: bool | None = None
+    backbone_ris_coordinate_mode: str | None = None
+    attention_enabled: bool | None = None
+    attention_ris_coordinate_enabled: bool | None = None
+    attention_antenna_index_enabled: bool | None = None
     observed_dense_attention_heads: int = 4
     spatial_residual_style: str = "scaled_true_residual"
     temporal_mode: str = "trend"
@@ -67,6 +74,7 @@ class TrainingConfig:
     adaptation: str = "full"
     architecture_version: str = ARCHITECTURE_VERSION
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
+    position_semantics_version: str = POSITION_SEMANTICS_VERSION
 
     def normalized(self) -> "TrainingConfig":
         return TrainingConfig(**{**asdict(self), "model_key": canonical_model_key(self.model_key)})
@@ -201,6 +209,11 @@ def require_checkpoint_contract(
             f"{purpose} requires spatial_protocol_version={SPATIAL_PROTOCOL_VERSION}; "
             f"checkpoint has {state.get('spatial_protocol_version')!r}."
         )
+    if state.get("position_semantics_version") != POSITION_SEMANTICS_VERSION:
+        raise ValueError(
+            f"{purpose} requires position_semantics_version={POSITION_SEMANTICS_VERSION}; "
+            f"checkpoint has {state.get('position_semantics_version')!r}."
+        )
     if domain != "mobility":
         return
     expected = DataSemantics.for_domain("mobility")
@@ -310,6 +323,8 @@ def train(
         raise ValueError("Training config architecture version mismatch.")
     if config.spatial_protocol_version != SPATIAL_PROTOCOL_VERSION:
         raise ValueError("Training config spatial protocol version mismatch.")
+    if config.position_semantics_version != POSITION_SEMANTICS_VERSION:
+        raise ValueError("Training config position semantics version mismatch.")
     if config.mode == "full" and config.amp:
         raise ValueError("Formal PriST-RIS training is FP32; AMP is development-only.")
     if run_dir.exists() and resume is None:
@@ -348,12 +363,31 @@ def train(
         temporal_rank=config.temporal_rank,
         temporal_residual=config.temporal_residual,
         coordinate_enabled=config.coordinate_enabled,
+        backbone_ris_coordinate_enabled=config.backbone_ris_coordinate_enabled,
+        backbone_antenna_index_enabled=config.backbone_antenna_index_enabled,
+        backbone_ris_coordinate_mode=config.backbone_ris_coordinate_mode,
+        attention_enabled=config.attention_enabled,
+        attention_ris_coordinate_enabled=config.attention_ris_coordinate_enabled,
+        attention_antenna_index_enabled=config.attention_antenna_index_enabled,
         observed_dense_attention_heads=config.observed_dense_attention_heads,
         spatial_residual_style=config.spatial_residual_style,
         temporal_mode=config.temporal_mode,
         architecture_version=config.architecture_version,
         spatial_protocol_version=config.spatial_protocol_version,
+        position_semantics_version=config.position_semantics_version,
     ).to(device)
+    config = TrainingConfig(
+        **{
+            **asdict(config),
+            "coordinate_enabled": None,
+            "backbone_ris_coordinate_enabled": model.config.backbone_ris_coordinate_enabled,
+            "backbone_antenna_index_enabled": model.config.backbone_antenna_index_enabled,
+            "backbone_ris_coordinate_mode": model.config.backbone_ris_coordinate_mode,
+            "attention_enabled": model.config.attention_enabled,
+            "attention_ris_coordinate_enabled": model.config.attention_ris_coordinate_enabled,
+            "attention_antenna_index_enabled": model.config.attention_antenna_index_enabled,
+        }
+    )
     pretrained_metadata = None
     if pretrained is not None:
         source = load_checkpoint(pretrained, device)
@@ -389,6 +423,23 @@ def train(
         history = list(state.get("history", []))
         stored_validation = state.get("validation")
         validation = stored_validation if isinstance(stored_validation, dict) else None
+    model_protocol = model.protocol_metadata()
+    position_metadata = {
+        key: model_protocol[key]
+        for key in (
+            "coordinate_enabled",
+            "legacy_coordinate_alias_used",
+            "backbone_ris_coordinate_enabled",
+            "backbone_antenna_index_enabled",
+            "backbone_ris_coordinate_mode",
+            "attention_enabled",
+            "attention_ris_coordinate_enabled",
+            "attention_antenna_index_enabled",
+            "position_semantics_version",
+            "antenna_encoding_semantics",
+        )
+    }
+    resolved_training_config = asdict(config)
     metadata = {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
@@ -396,6 +447,7 @@ def train(
             MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
         ),
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        **position_metadata,
         "model_key": config.model_key,
         "domain": config.domain,
         "seed": config.seed,
@@ -410,11 +462,11 @@ def train(
         "trainable_parameters": sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad),
         "trainable_parameter_names": trainable_names,
         "top_level_trainable_modules": sorted({name.split(".")[0] for name in trainable_names}),
-        "model_protocol": model.protocol_metadata(),
+        "model_protocol": model_protocol,
         "test_split_used": False,
     }
     (run_dir / "command.txt").write_text(command or shlex.join(sys.argv), encoding="utf-8")
-    _write_json(run_dir / "config.json", asdict(config))
+    _write_json(run_dir / "config.json", resolved_training_config)
     _write_json(run_dir / "metadata.json", metadata)
     _write_json(manifests / "data_semantics.json", semantics.to_dict())
     _write_json(manifests / "sample_indices.json", {"indices": sample_indices})
@@ -477,13 +529,14 @@ def train(
             "optimizer_state": optimizer.state_dict(),
             "epoch": epoch,
             "best_validation_nmse_linear": best_nmse,
-            "training_config": asdict(config),
+            "training_config": resolved_training_config,
             "model_config": asdict(model.config),
             "semantics_hash": semantics.stable_hash(),
             "mobility_contract_version": (
                 MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
             ),
             "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+            **position_metadata,
             "data_semantics": semantics.to_dict(),
             "prior_metadata": prior_metadata,
             "rng_state": capture_rng_state(),
@@ -529,6 +582,7 @@ def train(
             MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
         ),
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        **position_metadata,
         "model_key": config.model_key,
         "best_validation_nmse_linear": best_nmse,
         "best_validation_nmse_db": 10 * math.log10(max(best_nmse, 1e-12)),

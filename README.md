@@ -2,18 +2,18 @@
 
 PriST-RIS is a standalone PyTorch project for prior-guided spatio-temporal RIS channel reconstruction. Architecture version **3.2** repairs the spatial learning path while retaining the validated physical grid and Mobility q0/q3 data semantics.
 
-V3.0 evidence remains reproducible at commit `f10c90ecd1f3bb4d3764e9aa709db9843be0f995`; legacy runs and checkpoints are not overwritten. V3.2 checkpoints carry `architecture_version="3.2"` and `spatial_protocol_version="physical_stable_residual_v2"`. Mobility retains `mobility_contract_version="mobility_q0_q3_v1"` and its existing semantics hash, so post-fix q0/q3 Ridge artifacts remain reusable. V3.1 model checkpoints are rejected because their learned upsampling, prior mixing, residual, and correction-head contracts differ.
+V3.0 evidence remains reproducible at commit `f10c90ecd1f3bb4d3764e9aa709db9843be0f995`; legacy runs and checkpoints are not overwritten. Current checkpoints carry `architecture_version="3.2"`, `spatial_protocol_version="physical_stable_residual_position_v3"`, and `position_semantics_version="physical_ris_decoupled_v1"`. Mobility retains `mobility_contract_version="mobility_q0_q3_v1"` and its existing semantics hash, so post-fix q0/q3 Ridge artifacts remain reusable. Older model checkpoints without the decoupled position contract are rejected.
 
 ## Canonical model ladder
 
-| Key | Physical grid | Ridge prior | Coordinates | Observed→dense attention | Trend temporal |
+| Key | Physical grid | Ridge prior | Legacy default position bundle | Observed→dense attention | Trend temporal |
 |---|---:|---:|---:|---:|---:|
 | `prist_ris_a` | yes | no | no | no | no |
 | `prist_ris_b` | yes | yes | no | no | no |
 | `prist_ris_c` | yes | yes | yes | yes | no |
 | `prist_ris_full` | yes | yes | yes | yes | yes |
 
-C/Full use physical-coordinate-aware residual cross-attention on the shared observation feature before per-anchor prior fusion; antennas are never flattened into one global attention sequence. Mobility A/B/C return a compact two-anchor tensor whose semantic times are q0/q3. B/C/Full start exactly at the Ridge prediction because their correction heads are zero initialized. Full returns `[B,6,256,64,2]` in q0..q5 order with exact `q0=A0` and `q3=A3`; the temporal path is unchanged in this repair.
+C/Full retain their historical coupled default for reproducibility, but new experiments use six explicit switches that independently control backbone RIS coordinates, backbone antenna-index encoding, attention enablement, attention RIS coordinates, and attention antenna-index encoding. The old `coordinate_enabled` option is only a recorded compatibility alias. Antennas are never flattened into one global attention sequence. Mobility A/B/C return compact q0/q3 anchors; Full returns strict q0..q5 order.
 
 ## Frozen data and metric
 
@@ -58,5 +58,42 @@ prist-ris train \
 ```
 
 `audit` reads train and validation only. The first real-data gate is Mobility B, seed 123, FP32, stopped after epoch 5. Inspect Ridge equality at initialization, correction/ideal scale, validation NMSE, and gradient flow. Do not launch C or Full if B does not learn a useful residual. `evaluate --split test` remains protected by the exact freeze-manifest path/hash gate. No real-data improvement is claimed by the synthetic tests in this repository.
+
+## S1 spatial capacity/depth screening
+
+`screen-spatial` generates the fixed validation-only B64, B48, D1, and D2 plan without changing the canonical model. Every candidate is forced to stop at epoch 30 even when the general dev runner would otherwise consider extending a late-improving run.
+
+```bash
+export PRIOR=artifacts/v31_q0q3_ridge_mobility_dev4096.npz
+
+# Inspect the exact commands without starting training.
+prist-ris screen-spatial \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --device cuda --workers 8
+
+# On the shared server, inspect GPU 3 before starting the serial queue.
+nvidia-smi -i 3
+CUDA_VISIBLE_DEVICES=3 nohup prist-ris screen-spatial \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --device cuda --workers 8 --execute --confirm-gpu-free \
+  > s1_spatial_screen.log 2>&1 &
+```
+
+The queue runs one candidate at a time, invokes `nvidia-smi -i 3` before each candidate, refuses to overwrite incomplete runs, saves per-candidate profiles, and produces `summary.json` with best/last validation NMSE, best epoch, q0/q3, late-window improvement, parameters, GMAC/GFLOP, latency, peak memory, wall time, and the accuracy–GMAC Pareto frontier. Supply `--reference-run` and `--reference-profile` to compute reductions relative to the existing B80 result. TEST is never read.
+
+## P1-P3 position semantics screen
+
+`screen-position` generates three serial, fixed 30-epoch validation runs: P1 adds only backbone RIS coordinates by direct addition; P2 adds only zero-initialized gated backbone RIS coordinates; P3 enables observed-to-dense attention with RIS coordinates while leaving both backbone position paths and all antenna-index paths off. It does not schedule P4 or change the canonical model.
+
+```bash
+prist-ris screen-position \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --device cuda --workers 8
+
+nvidia-smi -i 3
+CUDA_VISIBLE_DEVICES=3 prist-ris screen-position \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --device cuda --workers 8 --execute --confirm-gpu-free
+```
 
 See `docs/` for the data, model, development, formal, transfer, isolation, and provenance contracts.

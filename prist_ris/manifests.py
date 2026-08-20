@@ -11,6 +11,7 @@ import torch
 from .contracts import (
     ARCHITECTURE_VERSION,
     MOBILITY_CONTRACT_VERSION,
+    POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
     DataSemantics,
     METRIC_CONTRACT,
@@ -179,6 +180,7 @@ def freeze_experiment(
         "architecture_version": ARCHITECTURE_VERSION,
         "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
         "commit": current_commit(project),
         "artifacts": artifacts,
         "baseline_manifest": baseline,
@@ -202,6 +204,7 @@ def validate_test_unlock(freeze_manifest: str | Path, checkpoint: str | Path) ->
         or frozen.get("architecture_version") != ARCHITECTURE_VERSION
         or frozen.get("mobility_contract_version") != MOBILITY_CONTRACT_VERSION
         or frozen.get("spatial_protocol_version") != SPATIAL_PROTOCOL_VERSION
+        or frozen.get("position_semantics_version") != POSITION_SEMANTICS_VERSION
         or frozen.get("test_unlocked") is not True
     ):
         raise PermissionError("Independent test is locked until a valid frozen experiment manifest unlocks it.")

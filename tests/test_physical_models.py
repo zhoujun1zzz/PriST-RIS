@@ -75,19 +75,19 @@ def test_antenna_encoding_is_index_not_physical_coordinate() -> None:
     assert AntennaIndexEncoder.semantics == "antenna_index_encoding"
 
 
-def test_coordinate_enabled_model_output_changes_when_embedding_disabled() -> None:
-    torch.manual_seed(7)
-    model = build_model("prist_ris_c", domain="mobility", **SMALL)
-    with torch.no_grad():
-        for head in model.anchor_heads:
-            head.weight.normal_(std=0.05)
-    batch = canonical_batch("mobility")
-    batch["obs_h"].normal_()
-    prior = torch.zeros(1, 2, 256, 64, 2)
-    enabled = model(batch, prior)
-    model.backbone.coordinate_enabled = False
-    disabled = model(batch, prior)
-    assert not torch.equal(enabled, disabled)
+def test_legacy_coordinate_alias_is_recorded_as_coupled_direct_add() -> None:
+    model = build_model(
+        "prist_ris_c", domain="mobility", coordinate_enabled=True, **SMALL
+    )
+    metadata = model.protocol_metadata()
+    assert metadata["legacy_coordinate_alias_used"] is True
+    assert metadata["backbone_ris_coordinate_enabled"] is True
+    assert metadata["backbone_antenna_index_enabled"] is True
+    assert metadata["backbone_ris_coordinate_mode"] == "direct_add"
+    assert metadata["attention_ris_coordinate_enabled"] is True
+    assert metadata["attention_antenna_index_enabled"] is True
+    reloaded = build_model(**vars(model.config))
+    assert reloaded.protocol_metadata()["backbone_ris_coordinate_mode"] == "direct_add"
 
 
 def test_canonical_ladder_and_dual_spatial_outputs() -> None:
