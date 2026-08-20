@@ -67,7 +67,7 @@ def _config(epochs: int = 1) -> TrainingConfig:
     )
 
 
-def test_checkpoint_contains_v31_reproducibility_contract(tmp_path: Path) -> None:
+def test_checkpoint_contains_v32_reproducibility_contract(tmp_path: Path) -> None:
     run = tmp_path / "run"
     train(_config(), _loader(), _loader(), run_dir=run, device=torch.device("cpu"))
     state = load_checkpoint(run / "checkpoints" / "last_checkpoint.pth", torch.device("cpu"))
@@ -75,7 +75,7 @@ def test_checkpoint_contains_v31_reproducibility_contract(tmp_path: Path) -> Non
     assert state["model_config"]["architecture_version"] == ARCHITECTURE_VERSION
     assert state["rng_state"] and state["train_loader_generator_state"] is not None
     metadata = (run / "metadata.json").read_text(encoding="utf-8")
-    assert '"architecture_version": "3.1"' in metadata
+    assert f'"architecture_version": "{ARCHITECTURE_VERSION}"' in metadata
     assert '"test_split_used": false' in metadata
 
 
@@ -106,9 +106,11 @@ def test_resume_is_bitwise_deterministic(tmp_path: Path) -> None:
         torch.testing.assert_close(value, second["model_state"][name], rtol=0, atol=0)
 
 
-def test_v30_checkpoint_is_rejected_by_version_guard() -> None:
-    with pytest.raises(ValueError, match="architecture_version=3.1"):
-        _require_architecture_version({"method": "PriST-RIS"}, "Resume")
+def test_legacy_checkpoint_is_rejected_by_version_guard() -> None:
+    with pytest.raises(ValueError, match=f"architecture_version={ARCHITECTURE_VERSION}"):
+        _require_architecture_version(
+            {"method": "PriST-RIS", "architecture_version": "3.1"}, "Resume"
+        )
 
 
 def test_tiny_overfit_loss_decreases() -> None:
@@ -188,7 +190,7 @@ def test_pre_attention_quasi_c_transfer_is_rejected() -> None:
         "model_config": {"domain": "quasi", "model_key": "prist_ris_c"},
         "model_state": source.state_dict(),
     }
-    with pytest.raises(ValueError, match="pre-attention"):
+    with pytest.raises(ValueError, match="spatial_protocol_version"):
         load_spatial_pretrained(target, state)
 
 
@@ -211,6 +213,7 @@ def test_quasi_a_backbone_transfer_remains_compatible() -> None:
         target,
         {
             "architecture_version": ARCHITECTURE_VERSION,
+            "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
             "model_config": {"domain": "quasi", "model_key": "prist_ris_a"},
             "model_state": source.state_dict(),
         },
@@ -274,6 +277,7 @@ def test_prefix_mobility_checkpoint_is_rejected_by_contract_guard() -> None:
     semantics = DataSemantics.for_domain("mobility")
     old_state = {
         "architecture_version": ARCHITECTURE_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "model_config": {"domain": "mobility"},
         "semantics_hash": semantics.stable_hash(),
         "data_semantics": semantics.to_dict(),
@@ -292,7 +296,7 @@ def test_old_q0q3_spatial_checkpoint_is_rejected(model_key: str) -> None:
         "semantics_hash": semantics.stable_hash(),
         "data_semantics": semantics.to_dict(),
     }
-    with pytest.raises(ValueError, match="pre-attention"):
+    with pytest.raises(ValueError, match="spatial_protocol_version"):
         require_checkpoint_contract(old_state, "Resume", expected_domain="mobility")
 
 
@@ -316,6 +320,7 @@ def test_spatial_protocol_does_not_invalidate_ridge_only_model_checkpoint() -> N
     semantics = DataSemantics.for_domain("mobility")
     state = {
         "architecture_version": ARCHITECTURE_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "mobility_contract_version": "mobility_q0_q3_v1",
         "model_config": {"domain": "mobility", "model_key": "prist_ris_b"},
         "semantics_hash": semantics.stable_hash(),

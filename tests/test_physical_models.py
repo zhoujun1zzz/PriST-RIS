@@ -78,6 +78,9 @@ def test_antenna_encoding_is_index_not_physical_coordinate() -> None:
 def test_coordinate_enabled_model_output_changes_when_embedding_disabled() -> None:
     torch.manual_seed(7)
     model = build_model("prist_ris_c", domain="mobility", **SMALL)
+    with torch.no_grad():
+        for head in model.anchor_heads:
+            head.weight.normal_(std=0.05)
     batch = canonical_batch("mobility")
     batch["obs_h"].normal_()
     prior = torch.zeros(1, 2, 256, 64, 2)

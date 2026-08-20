@@ -6,16 +6,16 @@ from dataclasses import asdict, dataclass
 
 
 MODEL_DISPLAY_NAME = "PriST-RIS"
-ARCHITECTURE_VERSION = "3.1"
+ARCHITECTURE_VERSION = "3.2"
 MOBILITY_CONTRACT_VERSION = "mobility_q0_q3_v1"
-SPATIAL_PROTOCOL_VERSION = "physical_obsdense_attn_v1"
+SPATIAL_PROTOCOL_VERSION = "physical_stable_residual_v2"
 MODEL_KEYS = (
     "prist_ris_a",
     "prist_ris_b",
     "prist_ris_c",
     "prist_ris_full",
 )
-# V3.0 aliases are intentionally not accepted: C/Full changed semantics in 3.1.
+# Legacy aliases are intentionally not accepted across architecture contracts.
 MODEL_ALIASES: dict[str, str] = {}
 OBSERVED_RIS_INDICES = tuple(range(0, 256, 8))
 GRID_HEIGHT = GRID_WIDTH = 16

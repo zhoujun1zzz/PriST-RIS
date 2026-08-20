@@ -154,8 +154,24 @@ def test_gradient_summary_reports_observed_attention_path() -> None:
     batch = canonical_batch("mobility")
     batch["obs_h"].normal_()
     prior = torch.randn(1, 2, 256, 64, 2)
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-3)
+    model(batch, prior).square().mean().backward()
+    first = parameter_group_gradient_norms(model)
+    assert first["observed_dense_attention"]["l2_norm"] == 0
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
     model(batch, prior).square().mean().backward()
     summary = parameter_group_gradient_norms(model)
     assert summary["observed_dense_attention"]["l2_norm"] > 0
     assert summary["backbone.input"]["gradient_tensors"] > 0
     assert summary["anchor_heads"]["gradient_tensors"] > 0
+    attention = model.observed_dense_attention
+    assert attention is not None
+    for projection in (
+        attention.query_projection,
+        attention.key_projection,
+        attention.value_projection,
+        attention.output_projection,
+    ):
+        assert projection.weight.grad is not None
+        assert float(projection.weight.grad.abs().sum()) > 0

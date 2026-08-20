@@ -53,7 +53,7 @@ class TrainingConfig:
     temporal_residual: bool = True
     coordinate_enabled: bool | None = None
     observed_dense_attention_heads: int = 4
-    spatial_residual_style: str = "post_activation"
+    spatial_residual_style: str = "scaled_true_residual"
     temporal_mode: str = "trend"
     learning_rate: float = 5e-4
     weight_decay: float = 1e-5
@@ -79,7 +79,12 @@ def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
     for parameter in model.parameters():
         parameter.requires_grad_(protocol in {"target_only_scratch", "full_finetune", "full"})
     if protocol == "frozen_spatial":
-        for module in (model.anchor_feature, model.anchor_heads, model.temporal, model.temporal_correction):
+        for module in (
+            model.anchor_refiners,
+            model.anchor_heads,
+            model.temporal,
+            model.temporal_correction,
+        ):
             if module is not None:
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
@@ -87,7 +92,7 @@ def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
         for module in (
             model.prior_encoder,
             model.observed_dense_attention,
-            model.anchor_feature,
+            model.anchor_refiners,
             model.anchor_heads,
             model.temporal_correction,
         ):
@@ -183,7 +188,7 @@ def _require_architecture_version(state: dict[str, object], purpose: str) -> Non
 def require_checkpoint_contract(
     state: dict[str, object], purpose: str, *, expected_domain: str | None = None
 ) -> None:
-    """Enforce Mobility time semantics and the C/Full spatial protocol."""
+    """Enforce the V3.2 spatial protocol and Mobility time semantics."""
     _require_architecture_version(state, purpose)
     config = state.get("model_config")
     domain = config.get("domain") if isinstance(config, dict) else None
@@ -191,13 +196,11 @@ def require_checkpoint_contract(
         raise ValueError(
             f"{purpose} requires domain={expected_domain}; checkpoint has {domain!r}."
         )
-    model_key = config.get("model_key") if isinstance(config, dict) else None
-    if model_key in {"prist_ris_c", "prist_ris_full"}:
-        if state.get("spatial_protocol_version") != SPATIAL_PROTOCOL_VERSION:
-            raise ValueError(
-                f"{purpose} rejects a pre-attention {model_key} checkpoint; expected "
-                f"spatial_protocol_version={SPATIAL_PROTOCOL_VERSION}."
-            )
+    if state.get("spatial_protocol_version") != SPATIAL_PROTOCOL_VERSION:
+        raise ValueError(
+            f"{purpose} requires spatial_protocol_version={SPATIAL_PROTOCOL_VERSION}; "
+            f"checkpoint has {state.get('spatial_protocol_version')!r}."
+        )
     if domain != "mobility":
         return
     expected = DataSemantics.for_domain("mobility")
@@ -209,7 +212,7 @@ def require_checkpoint_contract(
         or tuple(semantics.get("obs_time_index", ())) != expected.obs_time_index
     ):
         raise ValueError(
-            f"{purpose} rejects pre-fix Mobility V3.1 semantics; expected "
+            f"{purpose} rejects pre-fix Mobility semantics; expected "
             f"contract={MOBILITY_CONTRACT_VERSION} and pilots q0/q3."
         )
 
@@ -220,7 +223,7 @@ def load_spatial_pretrained(model: PriSTRIS, state: dict[str, object]) -> dict[s
     require_checkpoint_contract(state, "Spatial transfer", expected_domain="quasi")
     source_config = state.get("model_config")
     if not isinstance(source_config, dict) or source_config.get("domain") != "quasi":
-        raise ValueError("Spatial transfer source must be a Quasi PriST-RIS V3.1 checkpoint.")
+        raise ValueError("Spatial transfer source must be a Quasi PriST-RIS V3.2 checkpoint.")
     current = model.state_dict()
     source_state = state.get("model_state")
     if not isinstance(source_state, dict):
@@ -229,7 +232,7 @@ def load_spatial_pretrained(model: PriSTRIS, state: dict[str, object]) -> dict[s
         "backbone.",
         "prior_encoder.",
         "observed_dense_attention.",
-        "anchor_feature.",
+        "anchor_refiners.0.",
         "anchor_heads.0.",
     )
     loaded: list[str] = []
@@ -327,7 +330,7 @@ def train(
     expected_prior_blocks = (0,) if config.domain == "quasi" else (0, 3)
     if prior is not None and prior.target_blocks != expected_prior_blocks:
         raise ValueError(
-            f"PriST-RIS V3.1 {config.domain} requires Ridge target_blocks={expected_prior_blocks}, "
+            f"PriST-RIS V3.2 {config.domain} requires Ridge target_blocks={expected_prior_blocks}, "
             f"got {prior.target_blocks}."
         )
     prior_metadata = (
@@ -392,9 +395,7 @@ def train(
         "mobility_contract_version": (
             MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
         ),
-        "spatial_protocol_version": (
-            SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
-        ),
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "model_key": config.model_key,
         "domain": config.domain,
         "seed": config.seed,
@@ -482,9 +483,7 @@ def train(
             "mobility_contract_version": (
                 MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
             ),
-            "spatial_protocol_version": (
-                SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
-            ),
+            "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
             "data_semantics": semantics.to_dict(),
             "prior_metadata": prior_metadata,
             "rng_state": capture_rng_state(),
@@ -529,9 +528,7 @@ def train(
         "mobility_contract_version": (
             MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
         ),
-        "spatial_protocol_version": (
-            SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
-        ),
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "model_key": config.model_key,
         "best_validation_nmse_linear": best_nmse,
         "best_validation_nmse_db": 10 * math.log10(max(best_nmse, 1e-12)),

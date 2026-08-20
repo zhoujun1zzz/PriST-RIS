@@ -279,7 +279,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         target_blocks=target_blocks,
         adaptation=args.adaptation,
     )
-    run_name = args.run_name or f"v31_{args.domain}_{key}_{args.mode}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_name = args.run_name or f"v32_{args.domain}_{key}_{args.mode}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
     return train(
         config,
         train_loader,
@@ -415,7 +415,7 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
         or reference.get("architecture_version") != ARCHITECTURE_VERSION
         or reference.get("model_config", {}).get("model_key") != "prist_ris_full"
     ):
-        raise ValueError("Ablation reference must be the frozen PriST-RIS V3.1 Full seed-123 checkpoint.")
+        raise ValueError("Ablation reference must be the frozen PriST-RIS V3.2 Full seed-123 checkpoint.")
     frozen = reference.get("training_config", {})
     if frozen.get("domain") != "mobility" or int(frozen.get("seed", -1)) != 123:
         raise ValueError("Ablation reference must use Mobility and seed 123.")
@@ -440,7 +440,7 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             "--final-refine-blocks", frozen["final_refine_blocks"],
             "--temporal-rank", frozen["temporal_rank"],
             "--observed-dense-attention-heads", frozen.get("observed_dense_attention_heads", 4),
-            "--spatial-residual-style", frozen.get("spatial_residual_style", "post_activation"),
+            "--spatial-residual-style", frozen.get("spatial_residual_style", "scaled_true_residual"),
             "--temporal-mode", temporal_mode,
             "--target-blocks", target_scope,
             "--learning-rate", frozen["learning_rate"],
@@ -503,7 +503,7 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
         or source.get("architecture_version") != ARCHITECTURE_VERSION
         or source_config.get("domain") != "quasi"
     ):
-        raise ValueError("Transfer source must be a Quasi PriST-RIS V3.1 checkpoint.")
+        raise ValueError("Transfer source must be a Quasi PriST-RIS V3.2 checkpoint.")
     if source_model.get("model_key") not in {"prist_ris_c", "prist_ris_full"}:
         raise ValueError("Transfer source must use coordinate-enabled Quasi spatial weights.")
     for fraction in TRANSFER_FRACTIONS:
@@ -519,7 +519,7 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
                 "--final-refine-blocks", source_config["final_refine_blocks"],
                 "--temporal-rank", source_config["temporal_rank"],
                 "--observed-dense-attention-heads", source_config.get("observed_dense_attention_heads", 4),
-                "--spatial-residual-style", source_config.get("spatial_residual_style", "post_activation"),
+                "--spatial-residual-style", source_config.get("spatial_residual_style", "scaled_true_residual"),
                 "--learning-rate", source_config["learning_rate"],
                 "--weight-decay", source_config["weight_decay"],
                 "--run-name", name, "--output-root", root / "runs",
@@ -535,7 +535,7 @@ def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     device = torch.device(args.device)
     state = load_checkpoint(args.checkpoint, device)
     if state.get("method") != "PriST-RIS":
-        raise ValueError("Evaluation requires a PriST-RIS V3.1 checkpoint; V3.0 is not loaded silently.")
+        raise ValueError("Evaluation requires a PriST-RIS V3.2 checkpoint; legacy versions are not loaded silently.")
     model_config = dict(state["model_config"])
     require_checkpoint_contract(
         state, "Evaluation", expected_domain=str(model_config["domain"])
@@ -644,8 +644,8 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--spatial-residual-style",
         choices=("post_activation", "scaled_true_residual"),
-        default="post_activation",
-        help="Controlled spatial-block ablation; canonical V3.1 remains post_activation.",
+        default="scaled_true_residual",
+        help="Canonical V3.2 true residual; post_activation remains a legacy ablation only.",
     )
     parser.add_argument("--temporal-mode", choices=("trend", "no_delta", "static"), default="trend")
 
@@ -710,7 +710,7 @@ def parser() -> argparse.ArgumentParser:
     training.add_argument("--sample-index-manifest", type=Path)
     training.add_argument("--stop-after-epoch", type=int, help="Graceful preemption point; does not alter the frozen training config.")
     training.add_argument("--run-name")
-    training.add_argument("--output-root", type=Path, default=Path("runs/v3_1_dev"))
+    training.add_argument("--output-root", type=Path, default=Path("runs/v3_2_dev"))
     training.set_defaults(func=train_command)
 
     tune = commands.add_parser("tune")

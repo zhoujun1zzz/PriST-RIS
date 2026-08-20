@@ -1,6 +1,6 @@
 # Independent-test isolation
 
-This gate applies unchanged to PriST-RIS V3.1. Freeze rejects checkpoints whose `architecture_version` is not exactly `3.1`; Mobility checkpoints must also carry the post-fix `mobility_q0_q3_v1` contract and matching semantics hash, and the freeze manifest must declare `physical_obsdense_attn_v1` for the current C/Full protocol.
+This gate applies unchanged to PriST-RIS V3.2. Freeze rejects checkpoints whose `architecture_version` is not exactly `3.2` or whose spatial protocol is not `physical_stable_residual_v2`; Mobility checkpoints must also carry the post-fix `mobility_q0_q3_v1` contract and matching semantics hash.
 
 Test is locked by default at three layers:
 
