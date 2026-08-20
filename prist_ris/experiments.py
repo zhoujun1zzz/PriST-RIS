@@ -4,6 +4,8 @@ import json
 import statistics
 from pathlib import Path
 
+from .contracts import ARCHITECTURE_VERSION
+
 
 CAPACITY_HIDDEN = (64, 80, 96)
 LEARNING_RATES = (2e-4, 5e-4, 1e-3)
@@ -58,7 +60,7 @@ def targeted_tuning_plan(domain: str, seed: int = 123) -> dict[str, object]:
         "test_split_used": False,
         "seed": seed,
         "fixed": {
-            "architecture_version": "3.1",
+            "architecture_version": ARCHITECTURE_VERSION,
             "blocks_per_stage": [3, 3, 4],
             "final_refine_blocks": 4,
             "physical_grid": True,

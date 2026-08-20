@@ -30,6 +30,10 @@ OBSERVED_DENSE_ATTENTION_HEADS = 4
 OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE = 0.1
 
 
+def _tensor_rms(value: torch.Tensor) -> float:
+    return float(value.detach().float().square().mean().sqrt())
+
+
 def _canonical_indices(obs_ris_index: torch.Tensor, batch_size: int) -> torch.Tensor:
     if obs_ris_index.ndim == 2:
         if obs_ris_index.shape != (batch_size, 32):
@@ -96,6 +100,18 @@ def prior_to_physical_grid(prior: torch.Tensor) -> torch.Tensor:
     return grid.contiguous()
 
 
+def prior_anchor_to_physical_grid(prior: torch.Tensor) -> torch.Tensor:
+    """Map one complex anchor to an independent [B,2,64,16,16] grid."""
+
+    if prior.ndim != 5 or prior.shape[1:] != (1, 256, ANTENNAS, 2):
+        raise ValueError("prior anchor must have shape [B,1,256,64,2].")
+    batch_size = prior.shape[0]
+    grid = prior.reshape(batch_size, 1, 16, 16, ANTENNAS, 2)
+    return grid.permute(0, 1, 5, 4, 2, 3).reshape(
+        batch_size, 2, ANTENNAS, 16, 16
+    ).contiguous()
+
+
 def physical_grid_to_anchors(grid: torch.Tensor, anchors: int) -> torch.Tensor:
     if grid.ndim != 5 or grid.shape[1:] != (4, ANTENNAS, 16, 16):
         raise ValueError("anchor grid must have shape [B,4,64,16,16].")
@@ -146,7 +162,7 @@ class AntennaIndexEncoder(nn.Module):
 
 
 class StrongSpatioRISResidualBlock(nn.Module):
-    def __init__(self, hidden: int, residual_style: str = "post_activation") -> None:
+    def __init__(self, hidden: int, residual_style: str = "scaled_true_residual") -> None:
         super().__init__()
         if residual_style not in SPATIAL_RESIDUAL_STYLES:
             raise ValueError(
@@ -169,13 +185,13 @@ class StrongSpatioRISResidualBlock(nn.Module):
 class PhysicalColumnUpsample(nn.Module):
     def __init__(self, hidden: int) -> None:
         super().__init__()
-        self.upsample = nn.ConvTranspose3d(
-            hidden, hidden, kernel_size=(1, 1, 2), stride=(1, 1, 2)
-        )
+        self.hidden = hidden
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
         before = value.shape
-        result = self.upsample(value)
+        if value.ndim != 5 or value.shape[1] != self.hidden:
+            raise ValueError("PhysicalColumnUpsample expects [B,H,A,16,W].")
+        result = F.interpolate(value, scale_factor=(1, 1, 2), mode="nearest")
         if result.shape[2:4] != before[2:4] or result.shape[-1] != 2 * before[-1]:
             raise RuntimeError("Physical column upsampling changed a non-column axis.")
         return result
@@ -201,11 +217,11 @@ class PhysicalGridBackbone(nn.Module):
         final_refine_blocks: int = 4,
         *,
         coordinate_enabled: bool,
-        residual_style: str = "post_activation",
+        residual_style: str = "scaled_true_residual",
     ) -> None:
         super().__init__()
         if len(blocks_per_stage) != 3 or final_refine_blocks < 1:
-            raise ValueError("V3.1 requires three progressive stages and final refinement.")
+            raise ValueError("PriST-RIS V3.2 requires three progressive stages and final refinement.")
         self.hidden = hidden
         self.coordinate_enabled = coordinate_enabled
         self.residual_style = residual_style
@@ -542,14 +558,14 @@ class PriSTRISConfig:
     temporal_residual: bool = True
     coordinate_enabled: bool | None = None
     observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS
-    spatial_residual_style: str = "post_activation"
+    spatial_residual_style: str = "scaled_true_residual"
     temporal_mode: str = "trend"
     architecture_version: str = ARCHITECTURE_VERSION
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
 
 
 class PriSTRIS(nn.Module):
-    """Canonical PriST-RIS V3.1 physical-grid implementation."""
+    """Canonical PriST-RIS V3.2 stable prior-guided physical-grid model."""
 
     def __init__(self, config: PriSTRISConfig) -> None:
         super().__init__()
@@ -585,7 +601,7 @@ class PriSTRIS(nn.Module):
             coordinate_enabled=coordinate_enabled,
             residual_style=config.spatial_residual_style,
         )
-        self.prior_encoder = nn.Conv3d(4, config.hidden, 1) if self.uses_prior else None
+        self.prior_encoder = nn.Conv3d(2, config.hidden, 1) if self.uses_prior else None
         self.observed_dense_attention = (
             PhysicalObservedDenseResidualAttention(
                 config.hidden,
@@ -595,12 +611,19 @@ class PriSTRIS(nn.Module):
             if self.uses_observed_dense_attention
             else None
         )
-        self.anchor_feature = nn.Sequential(
-            nn.Conv3d(config.hidden, config.hidden, 3, padding=1), nn.GELU()
+        self.anchor_refiners = nn.ModuleList(
+            StrongSpatioRISResidualBlock(
+                config.hidden, config.spatial_residual_style
+            )
+            for _ in range(self.anchor_count)
         )
         self.anchor_heads = nn.ModuleList(
             nn.Conv3d(config.hidden, 2, 3, padding=1) for _ in range(self.anchor_count)
         )
+        if self.uses_prior:
+            for head in self.anchor_heads:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
         has_temporal = key == "prist_ris_full" and config.domain == "mobility"
         if config.temporal_mode not in {"trend", "no_delta", "static"}:
             raise ValueError("temporal_mode must be trend, no_delta, or static.")
@@ -619,20 +642,24 @@ class PriSTRIS(nn.Module):
             else None
         )
         self.last_stage_shapes: list[tuple[int, ...]] = []
+        self.last_spatial_feature_scales: dict[str, float] = {}
 
     def spatial_anchors(
         self, batch: Mapping[str, torch.Tensor], prior: torch.Tensor | None = None
     ) -> torch.Tensor:
         features, shapes = self.backbone(batch["obs_h"], batch["obs_ris_index"])
         self.last_stage_shapes = shapes
+        scales = {
+            "obs_input_rms": _tensor_rms(batch["obs_h"]),
+            "backbone_output_rms": _tensor_rms(features),
+        }
         if self.uses_prior:
             if prior is None:
                 raise ValueError(f"{self.config.model_key} requires an explicit Ridge prior artifact.")
             if prior.shape[1] != self.anchor_count:
                 raise ValueError(
-                    f"{self.config.domain} V3.1 prior must contain {self.anchor_count} anchor(s)."
+                    f"{self.config.domain} V3.2 prior must contain {self.anchor_count} anchor(s)."
                 )
-            features = features + self.prior_encoder(prior_to_physical_grid(prior))  # type: ignore[operator]
         if self.observed_dense_attention is not None:
             features = self.observed_dense_attention(
                 features,
@@ -640,11 +667,41 @@ class PriSTRIS(nn.Module):
                 batch["obs_ris_index"],
                 batch["obs_time_index"],
             )
-        anchor_features = self.anchor_feature(features)
-        anchor_grids = torch.cat([head(anchor_features) for head in self.anchor_heads], dim=1)
+            scales["attention_output_rms"] = _tensor_rms(features)
+        prior_features: list[torch.Tensor] = []
+        fused_features: list[torch.Tensor] = []
+        refined_features: list[torch.Tensor] = []
+        anchor_grids_list: list[torch.Tensor] = []
+        for anchor_index, (refiner, head) in enumerate(
+            zip(self.anchor_refiners, self.anchor_heads)
+        ):
+            fused = features
+            if self.uses_prior and prior is not None:
+                encoded = self.prior_encoder(  # type: ignore[operator]
+                    prior_anchor_to_physical_grid(prior[:, anchor_index : anchor_index + 1])
+                )
+                prior_features.append(encoded)
+                fused = fused + encoded
+            refined = refiner(fused)
+            fused_features.append(fused)
+            refined_features.append(refined)
+            anchor_grids_list.append(head(refined))
+        anchor_grids = torch.cat(anchor_grids_list, dim=1)
         if self.anchor_count == 1:
             anchor_grids = F.pad(anchor_grids, (0, 0, 0, 0, 0, 0, 0, 2))
         delta = physical_grid_to_anchors(anchor_grids, self.anchor_count)
+        if prior is not None:
+            scales["prior_raw_rms"] = _tensor_rms(prior)
+        if prior_features:
+            scales["prior_encoder_rms"] = _tensor_rms(torch.stack(prior_features, dim=1))
+        scales["fused_feature_rms"] = _tensor_rms(torch.stack(fused_features, dim=1))
+        scales["refined_feature_rms"] = _tensor_rms(torch.stack(refined_features, dim=1))
+        scales["delta_rms"] = _tensor_rms(delta)
+        if scales["backbone_output_rms"] > 0 and "prior_encoder_rms" in scales:
+            scales["prior_to_backbone_rms_ratio"] = (
+                scales["prior_encoder_rms"] / scales["backbone_output_rms"]
+            )
+        self.last_spatial_feature_scales = scales
         return delta + prior if self.uses_prior and prior is not None else delta
 
     def forward(
@@ -698,9 +755,11 @@ class PriSTRIS(nn.Module):
             "coordinate_enabled": self.config.coordinate_enabled,
             "antenna_encoding_semantics": "antenna_index_encoding",
             "spatial_residual_style": self.config.spatial_residual_style,
-            "spatial_protocol_version": (
-                SPATIAL_PROTOCOL_VERSION if self.uses_observed_dense_attention else None
-            ),
+            "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+            "deterministic_physical_upsampling": "nearest_column_only",
+            "per_anchor_prior_fusion": self.uses_prior,
+            "prior_encoder_input_channels": 2 if self.uses_prior else 0,
+            "zero_initialized_delta_heads": self.uses_prior,
             "observed_dense_attention": self.uses_observed_dense_attention,
             "observed_dense_attention_layers": 1 if self.uses_observed_dense_attention else 0,
             "observed_dense_attention_heads": (
@@ -742,7 +801,7 @@ def build_model(
     temporal_residual: bool = True,
     coordinate_enabled: bool | None = None,
     observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS,
-    spatial_residual_style: str = "post_activation",
+    spatial_residual_style: str = "scaled_true_residual",
     temporal_mode: str = "trend",
     architecture_version: str = ARCHITECTURE_VERSION,
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION,

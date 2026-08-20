@@ -12,6 +12,7 @@ import torch
 
 from prist_ris.cli import _allowed_test
 from prist_ris.contracts import (
+    ARCHITECTURE_VERSION,
     COMPLEX_LAYOUT,
     MOBILITY_CONTRACT_VERSION,
     OBSERVED_RIS_INDICES,
@@ -156,7 +157,7 @@ def test_exact_frozen_checkpoint_hash_gate(tmp_path: Path) -> None:
         json.dumps(
                 {
                     "schema": "prist_ris.frozen_experiment.v1",
-                    "architecture_version": "3.1",
+                    "architecture_version": ARCHITECTURE_VERSION,
                     "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
                     "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
                 "test_unlocked": True,

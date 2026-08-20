@@ -28,7 +28,7 @@ def profile_model(
 
     def count(module: nn.Module, inputs: tuple[torch.Tensor, ...], output: torch.Tensor) -> None:
         nonlocal macs
-        if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose3d)):
+        if isinstance(module, (nn.Conv2d, nn.Conv3d)):
             kernel = 1
             for width in module.kernel_size:
                 kernel *= width
@@ -37,7 +37,7 @@ def profile_model(
             macs += int(output.numel() * module.in_features)
 
     for module in model.modules():
-        if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.ConvTranspose3d, nn.Linear)):
+        if isinstance(module, (nn.Conv2d, nn.Conv3d, nn.Linear)):
             hooks.append(module.register_forward_hook(count))
     output = model(batch, prior)
     for hook in hooks:
@@ -72,9 +72,7 @@ def profile_model(
         "mobility_contract_version": (
             MOBILITY_CONTRACT_VERSION if domain == "mobility" else None
         ),
-        "spatial_protocol_version": (
-            SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
-        ),
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "model_key": model.config.model_key,
         "domain": domain,
         "input_shape": list(batch["obs_h"].shape),
@@ -101,7 +99,7 @@ def profile_model(
         "latency_ms_batch1": latency_ms,
         "peak_gpu_memory_bytes": peak,
         "convention": (
-            "batch1 FP32 single forward; Conv2d/Conv3d/ConvTranspose3d, linear, "
+            "batch1 FP32 single forward; Conv2d/Conv3d, linear, "
             "per-antenna observed-to-dense attention, and complex low-rank "
             "reconstruction; 1 real MAC=2 FLOPs"
         ),

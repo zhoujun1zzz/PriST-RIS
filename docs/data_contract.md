@@ -1,4 +1,6 @@
-# PriST-RIS V3.1 data contract
+# PriST-RIS V3.2 data contract
+
+V3.2 does not change the q0/q3 data semantics or semantics hash; it changes only the model-side spatial learning contract.
 
 `resolve_dataset_source()` is the single source resolver used by Dataset, audit, and DataLoader. Every resolved source records domain, split, path, input/target keys, and provenance.
 

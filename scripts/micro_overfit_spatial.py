@@ -15,7 +15,7 @@ sys.path.insert(0, str(PROJECT))
 
 from prist_ris.contracts import DataSemantics
 from prist_ris.data import make_loader
-from prist_ris.diagnostics import parameter_group_gradient_norms
+from prist_ris.diagnostics import parameter_group_gradient_norms, spatial_feature_scale_report
 from prist_ris.engine import move_batch, seed_everything
 from prist_ris.metrics import sample_linear_nmse
 from prist_ris.models import build_model
@@ -126,6 +126,9 @@ def main() -> None:
                         "step": step,
                         "loss": float(loss.detach()),
                         **_diagnostics(prediction, prior, target),
+                        "feature_scales": spatial_feature_scale_report(
+                            model, ideal_residual=target - prior
+                        ),
                         "gradient_norms": parameter_group_gradient_norms(model),
                     },
                     sort_keys=True,
