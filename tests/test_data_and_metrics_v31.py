@@ -15,6 +15,7 @@ from prist_ris.contracts import (
     COMPLEX_LAYOUT,
     MOBILITY_CONTRACT_VERSION,
     OBSERVED_RIS_INDICES,
+    SPATIAL_PROTOCOL_VERSION,
     DataSemantics,
 )
 from prist_ris.data import (
@@ -157,6 +158,7 @@ def test_exact_frozen_checkpoint_hash_gate(tmp_path: Path) -> None:
                     "schema": "prist_ris.frozen_experiment.v1",
                     "architecture_version": "3.1",
                     "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
+                    "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
                 "test_unlocked": True,
                 "artifacts": [
                     {

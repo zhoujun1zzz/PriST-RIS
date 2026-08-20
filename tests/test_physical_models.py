@@ -7,6 +7,7 @@ from prist_ris.models import (
     AntennaIndexEncoder,
     PHYSICAL_STAGE_COLUMNS,
     RISCoordinateEncoder,
+    StrongSpatioRISResidualBlock,
     build_model,
     canonical_batch,
     complex_factorized_reconstruction,
@@ -92,10 +93,42 @@ def test_canonical_ladder_and_dual_spatial_outputs() -> None:
         model = build_model(key, domain="mobility", **SMALL)
         prior = None if key == "prist_ris_a" else torch.zeros(1, 2, 256, 64, 2)
         assert model(batch, prior).shape == (1, 2, 256, 64, 2)
-        assert model.protocol_metadata()["cross_attention_layers"] == 0
+        assert model.protocol_metadata()["observed_dense_attention"] is (
+            key == "prist_ris_c"
+        )
     full = build_model("prist_ris_full", domain="mobility", **SMALL)
     assert full(batch, torch.zeros(1, 2, 256, 64, 2)).shape == (1, 6, 256, 64, 2)
     assert full.config.architecture_version == ARCHITECTURE_VERSION
+
+
+def test_scaled_true_residual_is_optional_and_exactly_scaled() -> None:
+    block = StrongSpatioRISResidualBlock(2, "scaled_true_residual")
+    value = torch.randn(1, 2, 2, 2, 2, requires_grad=True)
+    block.body = torch.nn.Identity()
+    output = block(value)
+    torch.testing.assert_close(output, value + 0.1 * torch.nn.functional.gelu(value))
+    output.sum().backward()
+    assert torch.isfinite(value.grad).all()
+
+
+def test_scaled_true_residual_is_identity_when_body_is_zero() -> None:
+    block = StrongSpatioRISResidualBlock(2, "scaled_true_residual")
+    with torch.no_grad():
+        for parameter in block.body.parameters():
+            parameter.zero_()
+    value = torch.randn(1, 2, 2, 2, 2)
+    torch.testing.assert_close(block(value), value)
+
+
+def test_both_spatial_residual_styles_preserve_shape_and_backward() -> None:
+    for style in ("post_activation", "scaled_true_residual"):
+        block = StrongSpatioRISResidualBlock(2, style)
+        value = torch.randn(1, 2, 3, 4, 5, requires_grad=True)
+        output = block(value)
+        assert output.shape == value.shape
+        assert torch.isfinite(output).all()
+        output.square().mean().backward()
+        assert value.grad is not None and torch.isfinite(value.grad).all()
 
 
 def test_full_q0_q3_equal_spatial_anchors() -> None:

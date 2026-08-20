@@ -16,6 +16,7 @@ from .complexity import profile_model
 from .contracts import (
     ARCHITECTURE_VERSION,
     MOBILITY_CONTRACT_VERSION,
+    SPATIAL_PROTOCOL_VERSION,
     MODEL_ALIASES,
     MODEL_KEYS,
     DataSemantics,
@@ -105,6 +106,7 @@ def audit_command(args: argparse.Namespace) -> dict[str, object]:
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
         "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "test_included": "test" in splits,
         "files": rows,
     }
@@ -124,6 +126,8 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
         temporal_rank=args.temporal_rank,
         temporal_residual=not args.no_temporal_residual,
         coordinate_enabled=args.coordinate_enabled,
+        observed_dense_attention_heads=args.observed_dense_attention_heads,
+        spatial_residual_style=args.spatial_residual_style,
         temporal_mode=args.temporal_mode,
     ).to(device)
     result = profile_model(model, domain=args.domain, device=device)
@@ -261,6 +265,8 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         temporal_rank=args.temporal_rank,
         temporal_residual=not args.no_temporal_residual,
         coordinate_enabled=args.coordinate_enabled,
+        observed_dense_attention_heads=args.observed_dense_attention_heads,
+        spatial_residual_style=args.spatial_residual_style,
         temporal_mode=args.temporal_mode,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -372,7 +378,11 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
         "seed": 123,
         "mechanisms": list(MECHANISM_ABLATIONS),
         "spatial_table": {
-            "variants": ["physical_grid_spatial", "prior_guided_dual_anchor", "coordinate_encoding"],
+            "variants": [
+                "physical_grid_spatial",
+                "prior_guided_dual_anchor",
+                "coordinate_observed_dense_attention",
+            ],
             "target_blocks": list(SPATIAL_ABLATION_TARGET_BLOCKS),
             "score_column": "observed_anchor_aggregate",
         },
@@ -412,7 +422,9 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
     mapping = {
         "physical_grid_spatial": ("prist_ris_a", "0,3", "trend", True),
         "prior_guided_dual_anchor": ("prist_ris_b", "0,3", "trend", True),
-        "coordinate_encoding": ("prist_ris_c", "0,3", "trend", True),
+        "coordinate_observed_dense_attention": (
+            "prist_ris_c", "0,3", "trend", True
+        ),
         "static_last_anchor": ("prist_ris_full", "0,1,2,3,4,5", "static", True),
         "no_delta_conditioning": ("prist_ris_full", "0,1,2,3,4,5", "no_delta", True),
         "trend_conditioned_temporal": ("prist_ris_full", "0,1,2,3,4,5", "trend", True),
@@ -427,6 +439,8 @@ def ablate_command(args: argparse.Namespace) -> dict[str, object]:
             "--blocks-per-stage", ",".join(str(v) for v in frozen["blocks_per_stage"]),
             "--final-refine-blocks", frozen["final_refine_blocks"],
             "--temporal-rank", frozen["temporal_rank"],
+            "--observed-dense-attention-heads", frozen.get("observed_dense_attention_heads", 4),
+            "--spatial-residual-style", frozen.get("spatial_residual_style", "post_activation"),
             "--temporal-mode", temporal_mode,
             "--target-blocks", target_scope,
             "--learning-rate", frozen["learning_rate"],
@@ -479,6 +493,9 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
     if args.source_checkpoint is None or args.prior is None:
         raise ValueError("Executing transfer requires --source-checkpoint and Mobility --prior.")
     source = load_checkpoint(args.source_checkpoint, torch.device("cpu"))
+    require_checkpoint_contract(
+        source, "Transfer source", expected_domain="quasi"
+    )
     source_config = source.get("training_config", {})
     source_model = source.get("model_config", {})
     if (
@@ -501,6 +518,8 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
                 "--blocks-per-stage", ",".join(str(v) for v in source_config["blocks_per_stage"]),
                 "--final-refine-blocks", source_config["final_refine_blocks"],
                 "--temporal-rank", source_config["temporal_rank"],
+                "--observed-dense-attention-heads", source_config.get("observed_dense_attention_heads", 4),
+                "--spatial-residual-style", source_config.get("spatial_residual_style", "post_activation"),
                 "--learning-rate", source_config["learning_rate"],
                 "--weight-decay", source_config["weight_decay"],
                 "--run-name", name, "--output-root", root / "runs",
@@ -620,6 +639,13 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Override canonical coordinate setting for controlled ablation.",
+    )
+    parser.add_argument("--observed-dense-attention-heads", type=int, default=4)
+    parser.add_argument(
+        "--spatial-residual-style",
+        choices=("post_activation", "scaled_true_residual"),
+        default="post_activation",
+        help="Controlled spatial-block ablation; canonical V3.1 remains post_activation.",
     )
     parser.add_argument("--temporal-mode", choices=("trend", "no_delta", "static"), default="trend")
 

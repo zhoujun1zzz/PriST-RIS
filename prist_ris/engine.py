@@ -18,6 +18,7 @@ from .checkpoint import capture_rng_state, load_checkpoint, restore_rng_state, s
 from .contracts import (
     ARCHITECTURE_VERSION,
     MOBILITY_CONTRACT_VERSION,
+    SPATIAL_PROTOCOL_VERSION,
     DataSemantics,
     canonical_model_key,
 )
@@ -51,6 +52,8 @@ class TrainingConfig:
     temporal_rank: int = 2
     temporal_residual: bool = True
     coordinate_enabled: bool | None = None
+    observed_dense_attention_heads: int = 4
+    spatial_residual_style: str = "post_activation"
     temporal_mode: str = "trend"
     learning_rate: float = 5e-4
     weight_decay: float = 1e-5
@@ -63,6 +66,7 @@ class TrainingConfig:
     target_blocks: tuple[int, ...] | None = None
     adaptation: str = "full"
     architecture_version: str = ARCHITECTURE_VERSION
+    spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
 
     def normalized(self) -> "TrainingConfig":
         return TrainingConfig(**{**asdict(self), "model_key": canonical_model_key(self.model_key)})
@@ -82,6 +86,7 @@ def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
     elif protocol == "selective":
         for module in (
             model.prior_encoder,
+            model.observed_dense_attention,
             model.anchor_feature,
             model.anchor_heads,
             model.temporal_correction,
@@ -178,7 +183,7 @@ def _require_architecture_version(state: dict[str, object], purpose: str) -> Non
 def require_checkpoint_contract(
     state: dict[str, object], purpose: str, *, expected_domain: str | None = None
 ) -> None:
-    """Reject pre-fix Mobility V3.1 checkpoints while retaining Quasi reuse."""
+    """Enforce Mobility time semantics and the C/Full spatial protocol."""
     _require_architecture_version(state, purpose)
     config = state.get("model_config")
     domain = config.get("domain") if isinstance(config, dict) else None
@@ -186,6 +191,13 @@ def require_checkpoint_contract(
         raise ValueError(
             f"{purpose} requires domain={expected_domain}; checkpoint has {domain!r}."
         )
+    model_key = config.get("model_key") if isinstance(config, dict) else None
+    if model_key in {"prist_ris_c", "prist_ris_full"}:
+        if state.get("spatial_protocol_version") != SPATIAL_PROTOCOL_VERSION:
+            raise ValueError(
+                f"{purpose} rejects a pre-attention {model_key} checkpoint; expected "
+                f"spatial_protocol_version={SPATIAL_PROTOCOL_VERSION}."
+            )
     if domain != "mobility":
         return
     expected = DataSemantics.for_domain("mobility")
@@ -194,7 +206,7 @@ def require_checkpoint_contract(
         state.get("mobility_contract_version") != MOBILITY_CONTRACT_VERSION
         or state.get("semantics_hash") != expected.stable_hash()
         or not isinstance(semantics, dict)
-        or semantics.get("obs_time_index") != list(expected.obs_time_index)
+        or tuple(semantics.get("obs_time_index", ())) != expected.obs_time_index
     ):
         raise ValueError(
             f"{purpose} rejects pre-fix Mobility V3.1 semantics; expected "
@@ -216,6 +228,7 @@ def load_spatial_pretrained(model: PriSTRIS, state: dict[str, object]) -> dict[s
     allowed_prefixes = (
         "backbone.",
         "prior_encoder.",
+        "observed_dense_attention.",
         "anchor_feature.",
         "anchor_heads.0.",
     )
@@ -292,6 +305,8 @@ def train(
     config = config.normalized()
     if config.architecture_version != ARCHITECTURE_VERSION:
         raise ValueError("Training config architecture version mismatch.")
+    if config.spatial_protocol_version != SPATIAL_PROTOCOL_VERSION:
+        raise ValueError("Training config spatial protocol version mismatch.")
     if config.mode == "full" and config.amp:
         raise ValueError("Formal PriST-RIS training is FP32; AMP is development-only.")
     if run_dir.exists() and resume is None:
@@ -330,8 +345,11 @@ def train(
         temporal_rank=config.temporal_rank,
         temporal_residual=config.temporal_residual,
         coordinate_enabled=config.coordinate_enabled,
+        observed_dense_attention_heads=config.observed_dense_attention_heads,
+        spatial_residual_style=config.spatial_residual_style,
         temporal_mode=config.temporal_mode,
         architecture_version=config.architecture_version,
+        spatial_protocol_version=config.spatial_protocol_version,
     ).to(device)
     pretrained_metadata = None
     if pretrained is not None:
@@ -373,6 +391,9 @@ def train(
         "architecture_version": ARCHITECTURE_VERSION,
         "mobility_contract_version": (
             MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
+        ),
+        "spatial_protocol_version": (
+            SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
         ),
         "model_key": config.model_key,
         "domain": config.domain,
@@ -461,6 +482,9 @@ def train(
             "mobility_contract_version": (
                 MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
             ),
+            "spatial_protocol_version": (
+                SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
+            ),
             "data_semantics": semantics.to_dict(),
             "prior_metadata": prior_metadata,
             "rng_state": capture_rng_state(),
@@ -504,6 +528,9 @@ def train(
         "architecture_version": ARCHITECTURE_VERSION,
         "mobility_contract_version": (
             MOBILITY_CONTRACT_VERSION if config.domain == "mobility" else None
+        ),
+        "spatial_protocol_version": (
+            SPATIAL_PROTOCOL_VERSION if model.uses_observed_dense_attention else None
         ),
         "model_key": config.model_key,
         "best_validation_nmse_linear": best_nmse,

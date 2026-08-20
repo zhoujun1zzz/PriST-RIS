@@ -10,6 +10,7 @@ from prist_ris.checkpoint import load_checkpoint
 from prist_ris.contracts import (
     ARCHITECTURE_VERSION,
     OBSERVED_RIS_INDICES,
+    SPATIAL_PROTOCOL_VERSION,
     DataSemantics,
 )
 from prist_ris.engine import (
@@ -151,15 +152,74 @@ def test_spatial_transfer_loads_only_compatible_weights() -> None:
     before_second_head = target.anchor_heads[1].weight.detach().clone()
     state = {
         "architecture_version": ARCHITECTURE_VERSION,
-        "model_config": {"domain": "quasi"},
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "model_config": {"domain": "quasi", "model_key": "prist_ris_c"},
         "model_state": source.state_dict(),
     }
     metadata = load_spatial_pretrained(target, state)
     torch.testing.assert_close(target.backbone.input.weight, source.backbone.input.weight)
     torch.testing.assert_close(target.anchor_heads[0].weight, source.anchor_heads[0].weight)
+    torch.testing.assert_close(
+        target.observed_dense_attention.query_projection.weight,
+        source.observed_dense_attention.query_projection.weight,
+    )
     torch.testing.assert_close(target.anchor_heads[1].weight, before_second_head)
     assert all(not name.startswith("temporal.") for name in metadata["loaded_keys"])
     assert any(name.startswith("temporal.") for name in metadata["newly_initialized_keys"])
+
+
+def test_pre_attention_quasi_c_transfer_is_rejected() -> None:
+    source = build_model(
+        "prist_ris_c",
+        domain="quasi",
+        hidden=4,
+        blocks_per_stage=(1, 1, 1),
+        final_refine_blocks=1,
+    )
+    target = build_model(
+        "prist_ris_full",
+        domain="mobility",
+        hidden=4,
+        blocks_per_stage=(1, 1, 1),
+        final_refine_blocks=1,
+    )
+    state = {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "model_config": {"domain": "quasi", "model_key": "prist_ris_c"},
+        "model_state": source.state_dict(),
+    }
+    with pytest.raises(ValueError, match="pre-attention"):
+        load_spatial_pretrained(target, state)
+
+
+def test_quasi_a_backbone_transfer_remains_compatible() -> None:
+    source = build_model(
+        "prist_ris_a",
+        domain="quasi",
+        hidden=4,
+        blocks_per_stage=(1, 1, 1),
+        final_refine_blocks=1,
+    )
+    target = build_model(
+        "prist_ris_full",
+        domain="mobility",
+        hidden=4,
+        blocks_per_stage=(1, 1, 1),
+        final_refine_blocks=1,
+    )
+    metadata = load_spatial_pretrained(
+        target,
+        {
+            "architecture_version": ARCHITECTURE_VERSION,
+            "model_config": {"domain": "quasi", "model_key": "prist_ris_a"},
+            "model_state": source.state_dict(),
+        },
+    )
+    assert "backbone.input.weight" in metadata["loaded_keys"]
+    assert any(
+        name.startswith("observed_dense_attention.")
+        for name in metadata["newly_initialized_keys"]
+    )
 
 
 def test_transfer_protocols_have_no_fake_adapter_and_distinct_sets() -> None:
@@ -220,6 +280,48 @@ def test_prefix_mobility_checkpoint_is_rejected_by_contract_guard() -> None:
     }
     with pytest.raises(ValueError, match="pre-fix Mobility"):
         require_checkpoint_contract(old_state, "Resume", expected_domain="mobility")
+
+
+@pytest.mark.parametrize("model_key", ["prist_ris_c", "prist_ris_full"])
+def test_old_q0q3_spatial_checkpoint_is_rejected(model_key: str) -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    old_state = {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": "mobility_q0_q3_v1",
+        "model_config": {"domain": "mobility", "model_key": model_key},
+        "semantics_hash": semantics.stable_hash(),
+        "data_semantics": semantics.to_dict(),
+    }
+    with pytest.raises(ValueError, match="pre-attention"):
+        require_checkpoint_contract(old_state, "Resume", expected_domain="mobility")
+
+
+def test_current_q0q3_attention_checkpoint_contract_is_accepted() -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    require_checkpoint_contract(
+        {
+            "architecture_version": ARCHITECTURE_VERSION,
+            "mobility_contract_version": "mobility_q0_q3_v1",
+            "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+            "model_config": {"domain": "mobility", "model_key": "prist_ris_c"},
+            "semantics_hash": semantics.stable_hash(),
+            "data_semantics": semantics.to_dict(),
+        },
+        "Resume",
+        expected_domain="mobility",
+    )
+
+
+def test_spatial_protocol_does_not_invalidate_ridge_only_model_checkpoint() -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    state = {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "mobility_contract_version": "mobility_q0_q3_v1",
+        "model_config": {"domain": "mobility", "model_key": "prist_ris_b"},
+        "semantics_hash": semantics.stable_hash(),
+        "data_semantics": semantics.to_dict(),
+    }
+    require_checkpoint_contract(state, "Resume", expected_domain="mobility")
 
 
 def test_loader_generator_state_is_normalized_to_cpu_uint8() -> None:
