@@ -58,6 +58,12 @@ from .manifests import (
 from .metrics import MetricAccumulator, PerQueryMetricAccumulator
 from .models import build_model
 from .prior import RidgePrior, RidgeStatistics, file_sha256
+from .screening import (
+    SPATIAL_SCREENING_CANDIDATES,
+    spatial_candidate_training_arguments,
+    spatial_screening_plan,
+    summarize_spatial_screening,
+)
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -135,6 +141,115 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
         _json(args.output, result)
     print(json.dumps(result, indent=2))
     return result
+
+
+def spatial_screen_command(args: argparse.Namespace) -> dict[str, object]:
+    """Plan, execute, or summarize the fixed S1 Mobility-B Pareto screen."""
+
+    root = Path(args.output_root) / (
+        args.study_name or f"v32_s1_spatial_pareto_seed{args.seed}"
+    )
+    prior_value: str | Path = args.prior if args.prior is not None else "$PRIOR"
+    plan = spatial_screening_plan(args.seed)
+    commands = {
+        candidate.name: [
+            "prist-ris",
+            *(
+                str(value)
+                for value in spatial_candidate_training_arguments(
+                    candidate,
+                    prior=prior_value,
+                    data_root=args.data_root,
+                    output_root=root / "runs",
+                    device=args.device,
+                    workers=args.workers,
+                    seed=args.seed,
+                )
+            ),
+        ]
+        for candidate in SPATIAL_SCREENING_CANDIDATES
+    }
+    plan["commands"] = commands
+    plan["physical_gpu_preflight"] = f"nvidia-smi -i {args.physical_gpu_index}"
+    write_plan(root / "screening_plan.json", plan)
+
+    if args.summarize_only:
+        summary = summarize_spatial_screening(
+            root,
+            reference_run=args.reference_run,
+            reference_profile=args.reference_profile,
+        )
+        _json(root / "summary.json", summary)
+        print(json.dumps(summary, indent=2))
+        return summary
+    if not args.execute:
+        print(json.dumps(plan, indent=2))
+        return plan
+    if args.prior is None:
+        raise ValueError("Executing S1 screening requires the fixed q0/q3 --prior artifact.")
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        if os.environ.get("CUDA_VISIBLE_DEVICES") != str(args.physical_gpu_index):
+            raise PermissionError(
+                f"Set CUDA_VISIBLE_DEVICES={args.physical_gpu_index} before executing S1."
+            )
+        if not args.confirm_gpu_free:
+            raise PermissionError(
+                "Inspect GPU 3 first, then pass --confirm-gpu-free to start the serial queue."
+            )
+    profiles = root / "profiles"
+    profiles.mkdir(parents=True, exist_ok=True)
+    for candidate in SPATIAL_SCREENING_CANDIDATES:
+        run_dir = root / "runs" / candidate.name
+        final_path = run_dir / "results" / "final_result.json"
+        if final_path.is_file():
+            print(f"reuse completed screening run: {run_dir}", flush=True)
+        elif run_dir.exists():
+            raise FileExistsError(
+                f"Incomplete run exists and will not be overwritten: {run_dir}"
+            )
+        else:
+            if device.type == "cuda":
+                subprocess.run(
+                    ["nvidia-smi", "-i", str(args.physical_gpu_index)], check=True
+                )
+            _invoke(
+                spatial_candidate_training_arguments(
+                    candidate,
+                    prior=args.prior,
+                    data_root=args.data_root,
+                    output_root=root / "runs",
+                    device=args.device,
+                    workers=args.workers,
+                    seed=args.seed,
+                ),
+                dry_run=False,
+            )
+        profile_path = profiles / f"{candidate.name}.json"
+        if not profile_path.is_file():
+            model = build_model(
+                "prist_ris_b",
+                domain="mobility",
+                hidden=candidate.hidden,
+                blocks_per_stage=candidate.blocks_per_stage,
+                final_refine_blocks=candidate.final_refine_blocks,
+                coordinate_enabled=False,
+            ).to(device)
+            _json(
+                profile_path,
+                profile_model(model, domain="mobility", device=device),
+            )
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+    summary = summarize_spatial_screening(
+        root,
+        reference_run=args.reference_run,
+        reference_profile=args.reference_profile,
+    )
+    _json(root / "summary.json", summary)
+    print(json.dumps(summary, indent=2))
+    return summary
 
 
 @torch.no_grad()
@@ -712,6 +827,23 @@ def parser() -> argparse.ArgumentParser:
     training.add_argument("--run-name")
     training.add_argument("--output-root", type=Path, default=Path("runs/v3_2_dev"))
     training.set_defaults(func=train_command)
+
+    screening = commands.add_parser("screen-spatial")
+    add_runtime_arguments(screening)
+    screening.add_argument("--prior", type=Path)
+    screening.add_argument("--seed", type=int, default=123)
+    screening.add_argument("--physical-gpu-index", type=int, default=3)
+    screening.add_argument("--confirm-gpu-free", action="store_true")
+    action = screening.add_mutually_exclusive_group()
+    action.add_argument("--execute", action="store_true")
+    action.add_argument("--summarize-only", action="store_true")
+    screening.add_argument("--reference-run", type=Path)
+    screening.add_argument("--reference-profile", type=Path)
+    screening.add_argument("--study-name")
+    screening.add_argument(
+        "--output-root", type=Path, default=Path("runs/spatial_screening")
+    )
+    screening.set_defaults(func=spatial_screen_command)
 
     tune = commands.add_parser("tune")
     add_runtime_arguments(tune)

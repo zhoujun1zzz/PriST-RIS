@@ -59,4 +59,26 @@ prist-ris train \
 
 `audit` reads train and validation only. The first real-data gate is Mobility B, seed 123, FP32, stopped after epoch 5. Inspect Ridge equality at initialization, correction/ideal scale, validation NMSE, and gradient flow. Do not launch C or Full if B does not learn a useful residual. `evaluate --split test` remains protected by the exact freeze-manifest path/hash gate. No real-data improvement is claimed by the synthetic tests in this repository.
 
+## S1 spatial capacity/depth screening
+
+`screen-spatial` generates the fixed validation-only B64, B48, D1, and D2 plan without changing the canonical model. Every candidate is forced to stop at epoch 30 even when the general dev runner would otherwise consider extending a late-improving run.
+
+```bash
+export PRIOR=artifacts/v31_q0q3_ridge_mobility_dev4096.npz
+
+# Inspect the exact commands without starting training.
+prist-ris screen-spatial \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --device cuda --workers 8
+
+# On the shared server, inspect GPU 3 before starting the serial queue.
+nvidia-smi -i 3
+CUDA_VISIBLE_DEVICES=3 nohup prist-ris screen-spatial \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --device cuda --workers 8 --execute --confirm-gpu-free \
+  > s1_spatial_screen.log 2>&1 &
+```
+
+The queue runs one candidate at a time, invokes `nvidia-smi -i 3` before each candidate, refuses to overwrite incomplete runs, saves per-candidate profiles, and produces `summary.json` with best/last validation NMSE, best epoch, q0/q3, late-window improvement, parameters, GMAC/GFLOP, latency, peak memory, wall time, and the accuracy–GMAC Pareto frontier. Supply `--reference-run` and `--reference-profile` to compute reductions relative to the existing B80 result. TEST is never read.
+
 See `docs/` for the data, model, development, formal, transfer, isolation, and provenance contracts.
