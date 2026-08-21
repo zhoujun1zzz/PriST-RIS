@@ -16,6 +16,8 @@ from .contracts import (
     OBSERVED_RIS_INDICES,
     POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
+    SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+    TEMPORAL_PROTOCOL_VERSION,
     canonical_model_key,
 )
 
@@ -27,6 +29,7 @@ PHYSICAL_STAGE_COLUMNS: dict[int, tuple[int, ...]] = {
     16: tuple(range(16)),
 }
 SPATIAL_RESIDUAL_STYLES = ("post_activation", "scaled_true_residual")
+SPATIAL_CHANNEL_ATTENTION_MODES = ("off", "se")
 BACKBONE_RIS_COORDINATE_MODES = ("off", "direct_add", "zero_init_gated")
 OBSERVED_DENSE_ATTENTION_HEADS = 4
 OBSERVED_DENSE_ATTENTION_RESIDUAL_SCALE = 0.1
@@ -114,6 +117,33 @@ def prior_anchor_to_physical_grid(prior: torch.Tensor) -> torch.Tensor:
     ).contiguous()
 
 
+def sample_ris_columns(value: torch.Tensor, width: int) -> torch.Tensor:
+    """Sample a row-major [B,Q,256,A,2] tensor at physical stage columns."""
+
+    if value.ndim != 5 or value.shape[2:] != (256, ANTENNAS, 2):
+        raise ValueError("value must have shape [B,Q,256,64,2].")
+    if width not in PHYSICAL_STAGE_COLUMNS:
+        raise ValueError(f"Unsupported physical stage width {width}.")
+    index = torch.tensor(
+        PHYSICAL_STAGE_COLUMNS[width], device=value.device, dtype=torch.long
+    )
+    grid = value.reshape(value.shape[0], value.shape[1], 16, 16, ANTENNAS, 2)
+    sampled = grid.index_select(3, index)
+    return sampled.reshape(
+        value.shape[0], value.shape[1], 16 * width, ANTENNAS, 2
+    ).contiguous()
+
+
+def prior_anchor_to_physical_grid_width(
+    prior: torch.Tensor, width: int
+) -> torch.Tensor:
+    grid = prior_anchor_to_physical_grid(prior)
+    index = torch.tensor(
+        PHYSICAL_STAGE_COLUMNS[width], device=grid.device, dtype=torch.long
+    )
+    return grid.index_select(-1, index)
+
+
 def physical_grid_to_anchors(grid: torch.Tensor, anchors: int) -> torch.Tensor:
     if grid.ndim != 5 or grid.shape[1:] != (4, ANTENNAS, 16, 16):
         raise ValueError("anchor grid must have shape [B,4,64,16,16].")
@@ -122,6 +152,24 @@ def physical_grid_to_anchors(grid: torch.Tensor, anchors: int) -> torch.Tensor:
     b = grid.shape[0]
     value = grid[:, : 2 * anchors].reshape(b, anchors, 2, ANTENNAS, 16, 16)
     return value.permute(0, 1, 4, 5, 3, 2).reshape(b, anchors, 256, ANTENNAS, 2).contiguous()
+
+
+def physical_grid_to_anchors_width(
+    grid: torch.Tensor, anchors: int, width: int
+) -> torch.Tensor:
+    if grid.ndim != 5 or grid.shape[1:] != (4, ANTENNAS, 16, width):
+        raise ValueError(
+            f"anchor grid must have shape [B,4,64,16,{width}]."
+        )
+    if anchors not in {1, 2}:
+        raise ValueError("anchors must be 1 or 2.")
+    b = grid.shape[0]
+    value = grid[:, : 2 * anchors].reshape(
+        b, anchors, 2, ANTENNAS, 16, width
+    )
+    return value.permute(0, 1, 4, 5, 3, 2).reshape(
+        b, anchors, 16 * width, ANTENNAS, 2
+    ).contiguous()
 
 
 class RISCoordinateEncoder(nn.Module):
@@ -163,25 +211,59 @@ class AntennaIndexEncoder(nn.Module):
         )
 
 
+class GatedSE3D(nn.Module):
+    """Lightweight channel modulation with an exact baseline-preserving gate."""
+
+    def __init__(self, hidden: int, reduction: int = 8) -> None:
+        super().__init__()
+        reduced = max(1, hidden // reduction)
+        self.reduce = nn.Linear(hidden, reduced)
+        self.expand = nn.Linear(reduced, hidden)
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, residual: torch.Tensor) -> torch.Tensor:
+        pooled = residual.mean(dim=(2, 3, 4))
+        modulation = torch.tanh(self.expand(F.gelu(self.reduce(pooled))))
+        return residual * (1.0 + self.gate * modulation[:, :, None, None, None])
+
+
 class StrongSpatioRISResidualBlock(nn.Module):
-    def __init__(self, hidden: int, residual_style: str = "scaled_true_residual") -> None:
+    def __init__(
+        self,
+        hidden: int,
+        residual_style: str = "scaled_true_residual",
+        channel_attention: str = "off",
+    ) -> None:
         super().__init__()
         if residual_style not in SPATIAL_RESIDUAL_STYLES:
             raise ValueError(
                 f"residual_style must be one of {SPATIAL_RESIDUAL_STYLES}."
             )
         self.residual_style = residual_style
+        if channel_attention not in SPATIAL_CHANNEL_ATTENTION_MODES:
+            raise ValueError(
+                f"channel_attention must be one of {SPATIAL_CHANNEL_ATTENTION_MODES}."
+            )
+        self.channel_attention = channel_attention
         self.body = nn.Sequential(
             nn.Conv3d(hidden, hidden, 3, padding=1),
             nn.GELU(),
             nn.Conv3d(hidden, hidden, 3, padding=1),
         )
+        # Do not perturb initialization of later baseline blocks when SE is enabled.
+        with torch.random.fork_rng(devices=[]):
+            self.se = GatedSE3D(hidden) if channel_attention == "se" else None
         self.activation = nn.GELU()
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
+        residual = self.body(value)
         if self.residual_style == "scaled_true_residual":
-            return value + 0.1 * F.gelu(self.body(value))
-        return self.activation(value + self.body(value))
+            residual = F.gelu(residual)
+        if self.se is not None:
+            residual = self.se(residual)
+        if self.residual_style == "scaled_true_residual":
+            return value + 0.1 * residual
+        return self.activation(value + residual)
 
 
 class PhysicalColumnUpsample(nn.Module):
@@ -200,11 +282,16 @@ class PhysicalColumnUpsample(nn.Module):
 
 
 class PhysicalProgressiveStage(nn.Module):
-    def __init__(self, hidden: int, blocks: int, residual_style: str) -> None:
+    def __init__(
+        self, hidden: int, blocks: int, residual_style: str, channel_attention: str
+    ) -> None:
         super().__init__()
         self.upsample = PhysicalColumnUpsample(hidden)
         self.blocks = nn.Sequential(
-            *(StrongSpatioRISResidualBlock(hidden, residual_style) for _ in range(blocks))
+            *(
+                StrongSpatioRISResidualBlock(hidden, residual_style, channel_attention)
+                for _ in range(blocks)
+            )
         )
 
     def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -222,6 +309,7 @@ class PhysicalGridBackbone(nn.Module):
         antenna_index_enabled: bool = False,
         ris_coordinate_mode: str = "off",
         residual_style: str = "scaled_true_residual",
+        channel_attention: str = "off",
     ) -> None:
         super().__init__()
         if len(blocks_per_stage) != 3 or final_refine_blocks < 1:
@@ -239,6 +327,7 @@ class PhysicalGridBackbone(nn.Module):
         self.antenna_index_enabled = antenna_index_enabled
         self.ris_coordinate_mode = ris_coordinate_mode
         self.residual_style = residual_style
+        self.channel_attention = channel_attention
         self.input = nn.Conv3d(4, hidden, 3, padding=1)
         # Optional position modules must not perturb the initialization of the
         # stable B path when a zero-init gate is added for an ablation.
@@ -255,12 +344,12 @@ class PhysicalGridBackbone(nn.Module):
             else None
         )
         self.stages = nn.ModuleList(
-            PhysicalProgressiveStage(hidden, blocks, residual_style)
+            PhysicalProgressiveStage(hidden, blocks, residual_style, channel_attention)
             for blocks in blocks_per_stage
         )
         self.final_refine = nn.Sequential(
             *(
-                StrongSpatioRISResidualBlock(hidden, residual_style)
+                StrongSpatioRISResidualBlock(hidden, residual_style, channel_attention)
                 for _ in range(final_refine_blocks)
             )
         )
@@ -277,21 +366,33 @@ class PhysicalGridBackbone(nn.Module):
         return result
 
     def forward(
-        self, observations: torch.Tensor, obs_ris_index: torch.Tensor
-    ) -> tuple[torch.Tensor, list[tuple[int, ...]]]:
+        self,
+        observations: torch.Tensor,
+        obs_ris_index: torch.Tensor,
+        *,
+        return_multiscale: bool = False,
+    ) -> tuple[torch.Tensor, list[tuple[int, ...]]] | tuple[
+        torch.Tensor, list[tuple[int, ...]], dict[int, torch.Tensor]
+    ]:
         grid = observations_to_physical_grid(observations, obs_ris_index)
         value = self.input(grid)
         if self.ris_coordinate_enabled or self.antenna_index_enabled:
             value = value + self._position_features(value, 0)
         shapes = [tuple(value.shape)]
+        multiscale: dict[int, torch.Tensor] = {}
         for stage_index, stage in enumerate(self.stages, start=1):
             value = stage(value)
             if self.ris_coordinate_enabled or self.antenna_index_enabled:
                 value = value + self._position_features(value, stage_index)
             shapes.append(tuple(value.shape))
+            if value.shape[-1] in {4, 8}:
+                multiscale[int(value.shape[-1])] = value
         value = self.final_refine(value)
         if value.shape[2:] != (ANTENNAS, 16, 16):
             raise RuntimeError(f"Physical backbone ended at {value.shape[2:]}, expected (64,16,16).")
+        if return_multiscale:
+            multiscale[16] = value
+            return value, shapes, multiscale
         return value, shapes
 
 
@@ -491,6 +592,10 @@ class TrendConditionedTemporal(nn.Module):
         self.fusion = nn.Sequential(nn.Linear(4 * hidden, 2 * hidden), nn.GELU())
         self.coefficient_head = nn.Linear(2 * hidden, 2 * rank)
         self.alpha_head = nn.Linear(2 * hidden, 1)
+        nn.init.zeros_(self.coefficient_head.weight)
+        nn.init.zeros_(self.coefficient_head.bias)
+        nn.init.zeros_(self.alpha_head.weight)
+        nn.init.zeros_(self.alpha_head.bias)
         self.last_delta_norm: float | None = None
         self.last_complex_dtype: torch.dtype | None = None
         self.last_missing_time_index: tuple[int, ...] | None = None
@@ -569,6 +674,23 @@ def normalized_time_coordinates(
     return (query_time - float(t0)) / float(t1 - t0)
 
 
+def linear_trend_non_pilot(
+    anchors: torch.Tensor,
+    query_time: torch.Tensor,
+    anchor_time_index: tuple[int, int] = (0, 3),
+) -> torch.Tensor:
+    """Deterministic q1/q2/q4/q5 trend with no learned parameters."""
+
+    query_values = tuple(int(value) for value in query_time.detach().cpu().tolist())
+    missing = tuple(value for value in query_values if value not in anchor_time_index)
+    if missing != (1, 2, 4, 5):
+        raise ValueError("Mobility non-pilot queries must be q1,q2,q4,q5.")
+    times = torch.tensor(missing, device=anchors.device, dtype=anchors.dtype)
+    alpha = normalized_time_coordinates(times, anchor_time_index).reshape(1, 4, 1, 1, 1)
+    a0, a3 = anchors[:, 0], anchors[:, 1]
+    return a0.unsqueeze(1) + alpha * (a3 - a0).unsqueeze(1)
+
+
 class FutureResidualCorrection(nn.Module):
     def __init__(self, hidden: int = 24) -> None:
         super().__init__()
@@ -577,6 +699,8 @@ class FutureResidualCorrection(nn.Module):
             StrongSpatioRISResidualBlock(hidden), StrongSpatioRISResidualBlock(hidden)
         )
         self.output = nn.Conv3d(hidden, 2, 3, padding=1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
 
     def forward(self, non_pilot: torch.Tensor) -> torch.Tensor:
         if non_pilot.shape[1:] != (4, 256, ANTENNAS, 2):
@@ -597,6 +721,8 @@ class PriSTRISConfig:
     final_refine_blocks: int = 4
     temporal_rank: int = 2
     temporal_residual: bool = True
+    spatial_multiscale_supervision: bool = False
+    spatial_channel_attention: str = "off"
     # Deprecated compatibility alias. New experiments must use the explicit
     # position flags below.
     coordinate_enabled: bool | None = None
@@ -609,9 +735,13 @@ class PriSTRISConfig:
     observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS
     spatial_residual_style: str = "scaled_true_residual"
     temporal_mode: str = "trend"
+    temporal_base_mode: str | None = None
+    temporal_learned_residual_enabled: bool | None = None
     architecture_version: str = ARCHITECTURE_VERSION
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
     position_semantics_version: str = POSITION_SEMANTICS_VERSION
+    spatial_supervision_protocol_version: str = SPATIAL_SUPERVISION_PROTOCOL_VERSION
+    temporal_protocol_version: str = TEMPORAL_PROTOCOL_VERSION
 
 
 class PriSTRIS(nn.Module):
@@ -628,6 +758,14 @@ class PriSTRIS(nn.Module):
             raise ValueError("PriST-RIS spatial protocol version mismatch.")
         if config.position_semantics_version != POSITION_SEMANTICS_VERSION:
             raise ValueError("PriST-RIS position semantics version mismatch.")
+        if config.spatial_supervision_protocol_version != SPATIAL_SUPERVISION_PROTOCOL_VERSION:
+            raise ValueError("PriST-RIS spatial supervision protocol version mismatch.")
+        if config.temporal_protocol_version != TEMPORAL_PROTOCOL_VERSION:
+            raise ValueError("PriST-RIS temporal protocol version mismatch.")
+        if config.spatial_channel_attention not in SPATIAL_CHANNEL_ATTENTION_MODES:
+            raise ValueError(
+                f"spatial_channel_attention must be one of {SPATIAL_CHANNEL_ATTENTION_MODES}."
+            )
         explicit_position = (
             config.backbone_ris_coordinate_enabled,
             config.backbone_antenna_index_enabled,
@@ -728,6 +866,7 @@ class PriSTRIS(nn.Module):
             antenna_index_enabled=backbone_antenna_index_enabled,
             ris_coordinate_mode=backbone_ris_coordinate_mode,
             residual_style=config.spatial_residual_style,
+            channel_attention=config.spatial_channel_attention,
         )
         self.prior_encoder = nn.Conv3d(2, config.hidden, 1) if self.uses_prior else None
         self.observed_dense_attention = (
@@ -742,7 +881,9 @@ class PriSTRIS(nn.Module):
         )
         self.anchor_refiners = nn.ModuleList(
             StrongSpatioRISResidualBlock(
-                config.hidden, config.spatial_residual_style
+                config.hidden,
+                config.spatial_residual_style,
+                config.spatial_channel_attention,
             )
             for _ in range(self.anchor_count)
         )
@@ -756,13 +897,36 @@ class PriSTRIS(nn.Module):
         has_temporal = key == "prist_ris_full" and config.domain == "mobility"
         if config.temporal_mode not in {"trend", "no_delta", "static"}:
             raise ValueError("temporal_mode must be trend, no_delta, or static.")
+        temporal_base_mode = config.temporal_base_mode or (
+            "static" if config.temporal_mode == "static" else "linear_trend"
+        )
+        if temporal_base_mode not in {"static", "linear_trend"}:
+            raise ValueError("temporal_base_mode must be static or linear_trend.")
+        temporal_learned_residual_enabled = (
+            has_temporal and config.temporal_mode != "static"
+            if config.temporal_learned_residual_enabled is None
+            else config.temporal_learned_residual_enabled
+        )
+        if temporal_base_mode == "static" and temporal_learned_residual_enabled:
+            raise ValueError("Static temporal base cannot enable the trend residual network.")
+        self.config = PriSTRISConfig(
+            **{
+                **asdict(self.config),
+                "temporal_base_mode": temporal_base_mode,
+                "temporal_learned_residual_enabled": temporal_learned_residual_enabled,
+            }
+        )
+        self.legacy_temporal_mode_used = (
+            config.temporal_base_mode is None
+            and config.temporal_learned_residual_enabled is None
+        )
         self.temporal = (
             TrendConditionedTemporal(
                 config.hidden,
                 config.temporal_rank,
                 use_delta=config.temporal_mode != "no_delta",
             )
-            if has_temporal and config.temporal_mode != "static"
+            if has_temporal and temporal_learned_residual_enabled
             else None
         )
         self.temporal_correction = (
@@ -833,20 +997,67 @@ class PriSTRIS(nn.Module):
         self.last_spatial_feature_scales = scales
         return delta + prior if self.uses_prior and prior is not None else delta
 
+    def spatial_multiscale_anchors(
+        self, batch: Mapping[str, torch.Tensor], prior: torch.Tensor | None = None
+    ) -> dict[int, torch.Tensor]:
+        """Training-only shared-head predictions at physical widths 4/8/16."""
+
+        if not self.config.spatial_multiscale_supervision:
+            raise RuntimeError("Multi-scale anchors require spatial_multiscale_supervision=True.")
+        if prior is None or not self.uses_prior:
+            raise ValueError("Multi-scale supervision requires the fixed Ridge prior.")
+        _, shapes, feature_by_width = self.backbone(
+            batch["obs_h"], batch["obs_ris_index"], return_multiscale=True
+        )
+        self.last_stage_shapes = shapes
+        results: dict[int, torch.Tensor] = {}
+        for width in (4, 8, 16):
+            features = feature_by_width[width]
+            if width == 16 and self.observed_dense_attention is not None:
+                features = self.observed_dense_attention(
+                    features,
+                    batch["obs_h"],
+                    batch["obs_ris_index"],
+                    batch["obs_time_index"],
+                )
+            grids: list[torch.Tensor] = []
+            for anchor_index, (refiner, head) in enumerate(
+                zip(self.anchor_refiners, self.anchor_heads)
+            ):
+                encoded = self.prior_encoder(  # type: ignore[operator]
+                    prior_anchor_to_physical_grid_width(
+                        prior[:, anchor_index : anchor_index + 1], width
+                    )
+                )
+                grids.append(head(refiner(features + encoded)))
+            anchor_grid = torch.cat(grids, dim=1)
+            if self.anchor_count == 1:
+                anchor_grid = F.pad(anchor_grid, (0, 0, 0, 0, 0, 0, 0, 2))
+            delta = physical_grid_to_anchors_width(
+                anchor_grid, self.anchor_count, width
+            )
+            results[width] = delta + sample_ris_columns(prior, width)
+        return results
+
     def forward(
         self, batch: Mapping[str, torch.Tensor], prior: torch.Tensor | None = None
     ) -> torch.Tensor:
-        anchors = self.spatial_anchors(batch, prior)
+        cached = batch.get("spatial_anchors")
+        anchors = cached if cached is not None else self.spatial_anchors(batch, prior)
         if self.config.domain == "quasi" or self.config.model_key != "prist_ris_full":
             return anchors
         query_time = batch["query_time"][0] if batch["query_time"].ndim > 1 else batch["query_time"]
-        if self.config.temporal_mode == "static":
+        if self.config.temporal_base_mode == "static":
             non_pilot = anchors[:, 1:2].expand(-1, 4, -1, -1, -1)
-        else:
+        elif self.temporal is not None:
             non_pilot = self.temporal(  # type: ignore[operator]
                 anchors,
                 query_time,
                 tuple(self.spatial_anchor_time_index),
+            )
+        else:
+            non_pilot = linear_trend_non_pilot(
+                anchors, query_time, tuple(self.spatial_anchor_time_index)
             )
         if self.temporal_correction is not None:
             non_pilot = self.temporal_correction(non_pilot)
@@ -892,6 +1103,9 @@ class PriSTRIS(nn.Module):
             "position_semantics_version": POSITION_SEMANTICS_VERSION,
             "antenna_encoding_semantics": "antenna_index_encoding",
             "spatial_residual_style": self.config.spatial_residual_style,
+            "spatial_multiscale_supervision": self.config.spatial_multiscale_supervision,
+            "spatial_channel_attention": self.config.spatial_channel_attention,
+            "spatial_supervision_protocol_version": SPATIAL_SUPERVISION_PROTOCOL_VERSION,
             "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
             "deterministic_physical_upsampling": "nearest_column_only",
             "per_anchor_prior_fusion": self.uses_prior,
@@ -918,6 +1132,20 @@ class PriSTRIS(nn.Module):
                 if self.config.domain == "mobility" and self.config.model_key == "prist_ris_full"
                 else None
             ),
+            "legacy_temporal_mode_used": self.legacy_temporal_mode_used,
+            "temporal_base_mode": (
+                self.config.temporal_base_mode if self.config.model_key == "prist_ris_full" else None
+            ),
+            "temporal_learned_residual_enabled": (
+                self.config.temporal_learned_residual_enabled
+                if self.config.model_key == "prist_ris_full"
+                else False
+            ),
+            "temporal_protocol_version": TEMPORAL_PROTOCOL_VERSION,
+            "temporal_exact_linear_trend_init": bool(
+                self.config.model_key == "prist_ris_full"
+                and self.config.temporal_base_mode == "linear_trend"
+            ),
             "temporal_rank": self.config.temporal_rank if self.temporal is not None else None,
             "temporal_prediction_scope": (
                 "non_pilot_q1_q2_q4_q5" if self.temporal is not None else None
@@ -936,6 +1164,8 @@ def build_model(
     final_refine_blocks: int = 4,
     temporal_rank: int = 2,
     temporal_residual: bool = True,
+    spatial_multiscale_supervision: bool = False,
+    spatial_channel_attention: str = "off",
     coordinate_enabled: bool | None = None,
     backbone_ris_coordinate_enabled: bool | None = None,
     backbone_antenna_index_enabled: bool | None = None,
@@ -946,9 +1176,13 @@ def build_model(
     observed_dense_attention_heads: int = OBSERVED_DENSE_ATTENTION_HEADS,
     spatial_residual_style: str = "scaled_true_residual",
     temporal_mode: str = "trend",
+    temporal_base_mode: str | None = None,
+    temporal_learned_residual_enabled: bool | None = None,
     architecture_version: str = ARCHITECTURE_VERSION,
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION,
     position_semantics_version: str = POSITION_SEMANTICS_VERSION,
+    spatial_supervision_protocol_version: str = SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+    temporal_protocol_version: str = TEMPORAL_PROTOCOL_VERSION,
 ) -> PriSTRIS:
     return PriSTRIS(
         PriSTRISConfig(
@@ -959,6 +1193,8 @@ def build_model(
             final_refine_blocks=final_refine_blocks,
             temporal_rank=temporal_rank,
             temporal_residual=temporal_residual,
+            spatial_multiscale_supervision=spatial_multiscale_supervision,
+            spatial_channel_attention=spatial_channel_attention,
             coordinate_enabled=coordinate_enabled,
             backbone_ris_coordinate_enabled=backbone_ris_coordinate_enabled,
             backbone_antenna_index_enabled=backbone_antenna_index_enabled,
@@ -969,9 +1205,13 @@ def build_model(
             observed_dense_attention_heads=observed_dense_attention_heads,
             spatial_residual_style=spatial_residual_style,
             temporal_mode=temporal_mode,
+            temporal_base_mode=temporal_base_mode,
+            temporal_learned_residual_enabled=temporal_learned_residual_enabled,
             architecture_version=architecture_version,
             spatial_protocol_version=spatial_protocol_version,
             position_semantics_version=position_semantics_version,
+            spatial_supervision_protocol_version=spatial_supervision_protocol_version,
+            temporal_protocol_version=temporal_protocol_version,
         )
     )
 

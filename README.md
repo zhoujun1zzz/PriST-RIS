@@ -97,3 +97,26 @@ CUDA_VISIBLE_DEVICES=3 prist-ris screen-position \
 ```
 
 See `docs/` for the data, model, development, formal, transfer, isolation, and provenance contracts.
+
+## Unified S2/S3 and T0-T4 screening
+
+The optional module framework keeps the V3.2 spatial checkpoint contract intact. S2 adds shared-head supervision at physical widths 4/8/16 and is training-only; S3 adds gated 3D SE and changes the inference graph. The temporal path independently selects a static or deterministic linear-trend base, an optional learned residual, and optional delta/curvature losses.
+
+```bash
+# Plan only; no data or GPU work is started.
+prist-ris screen-spatial-modules --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT"
+prist-ris screen-temporal --prior "$PRIOR" \
+  --spatial-checkpoint "$SPATIAL_CHECKPOINT" \
+  --anchor-cache-root "$ANCHOR_CACHE_ROOT" \
+  --data-root "$PRIST_RIS_DATA_ROOT" --include-curvature
+
+# TRAIN/VALIDATION-only temporal statistics and fixed spatial-anchor cache.
+prist-ris audit-temporal --data-root "$PRIST_RIS_DATA_ROOT"
+prist-ris cache-spatial-anchors --checkpoint "$SPATIAL_CHECKPOINT" \
+  --prior "$PRIOR" --data-root "$PRIST_RIS_DATA_ROOT" \
+  --max-train 4096 --max-validation 1800 --output-root "$ANCHOR_CACHE_ROOT"
+```
+
+Both runners execute candidates serially for exactly 30 epochs. A candidate extends to 40 when its best epoch is at least 26, or when epoch 21 to 30 improves by at least 0.05 dB and its best score is within 0.30 dB of the fixed reference. A 100-epoch continuation is only recommended when the 40-epoch best is at or after epoch 36 or within 0.10 dB of the reference; it runs only with `--run-long-followups`. TEST is never opened by these workflows, the supplied Ridge artifact is never refit, completed runs are reused, and incomplete runs are never overwritten.
+
+See [the unified screening protocol](docs/unified_module_screening.md) and [the GPU3 serial launcher](scripts/run_unified_screening_gpu3.sh) for exact execution commands.

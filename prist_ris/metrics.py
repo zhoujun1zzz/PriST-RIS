@@ -63,6 +63,11 @@ class PerQueryMetricAccumulator:
         )
         self.pilots = MetricAccumulator() if self.pilot_positions else None
         self.non_pilots = MetricAccumulator() if self.non_pilot_positions else None
+        full_mobility = self.query_time_index == tuple(range(6))
+        self.interpolation = MetricAccumulator() if full_mobility else None
+        self.extrapolation = MetricAccumulator() if full_mobility else None
+        self.delta = MetricAccumulator() if full_mobility else None
+        self.curvature = MetricAccumulator() if full_mobility else None
         self.overall = MetricAccumulator()
 
     def update(self, prediction: torch.Tensor, target: torch.Tensor) -> None:
@@ -81,6 +86,25 @@ class PerQueryMetricAccumulator:
             self.non_pilots.update(
                 prediction.index_select(1, index), target.index_select(1, index)
             )
+        if self.interpolation is not None:
+            interpolation = torch.tensor((1, 2), device=prediction.device)
+            extrapolation = torch.tensor((4, 5), device=prediction.device)
+            self.interpolation.update(
+                prediction.index_select(1, interpolation),
+                target.index_select(1, interpolation),
+            )
+            self.extrapolation.update(  # type: ignore[union-attr]
+                prediction.index_select(1, extrapolation),
+                target.index_select(1, extrapolation),
+            )
+            self.delta.update(  # type: ignore[union-attr]
+                prediction[:, 1:] - prediction[:, :-1],
+                target[:, 1:] - target[:, :-1],
+            )
+            self.curvature.update(  # type: ignore[union-attr]
+                prediction[:, 2:] - 2.0 * prediction[:, 1:-1] + prediction[:, :-2],
+                target[:, 2:] - 2.0 * target[:, 1:-1] + target[:, :-2],
+            )
 
     def compute(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -97,4 +121,9 @@ class PerQueryMetricAccumulator:
             result["observed_anchor_aggregate"] = self.pilots.compute()
         if self.non_pilots is not None:
             result["non_pilot_aggregate"] = self.non_pilots.compute()
+        if self.interpolation is not None:
+            result["interpolation_q1_q2"] = self.interpolation.compute()
+            result["extrapolation_q4_q5"] = self.extrapolation.compute()  # type: ignore[union-attr]
+            result["delta_error"] = self.delta.compute()  # type: ignore[union-attr]
+            result["curvature_error"] = self.curvature.compute()  # type: ignore[union-attr]
         return result

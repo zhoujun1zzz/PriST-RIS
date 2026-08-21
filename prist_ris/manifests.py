@@ -13,6 +13,8 @@ from .contracts import (
     MOBILITY_CONTRACT_VERSION,
     POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
+    SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+    TEMPORAL_PROTOCOL_VERSION,
     DataSemantics,
     METRIC_CONTRACT,
 )
@@ -181,6 +183,8 @@ def freeze_experiment(
         "mobility_contract_version": MOBILITY_CONTRACT_VERSION,
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "position_semantics_version": POSITION_SEMANTICS_VERSION,
+        "spatial_supervision_protocol_version": SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+        "temporal_protocol_version": TEMPORAL_PROTOCOL_VERSION,
         "commit": current_commit(project),
         "artifacts": artifacts,
         "baseline_manifest": baseline,
@@ -205,6 +209,9 @@ def validate_test_unlock(freeze_manifest: str | Path, checkpoint: str | Path) ->
         or frozen.get("mobility_contract_version") != MOBILITY_CONTRACT_VERSION
         or frozen.get("spatial_protocol_version") != SPATIAL_PROTOCOL_VERSION
         or frozen.get("position_semantics_version") != POSITION_SEMANTICS_VERSION
+        or frozen.get("spatial_supervision_protocol_version")
+        != SPATIAL_SUPERVISION_PROTOCOL_VERSION
+        or frozen.get("temporal_protocol_version") != TEMPORAL_PROTOCOL_VERSION
         or frozen.get("test_unlocked") is not True
     ):
         raise PermissionError("Independent test is locked until a valid frozen experiment manifest unlocks it.")

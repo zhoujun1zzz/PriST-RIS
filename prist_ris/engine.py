@@ -20,12 +20,14 @@ from .contracts import (
     MOBILITY_CONTRACT_VERSION,
     POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
+    SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+    TEMPORAL_PROTOCOL_VERSION,
     DataSemantics,
     canonical_model_key,
 )
 from .metrics import MetricAccumulator, PerQueryMetricAccumulator
-from .models import PriSTRIS, build_model
-from .objectives import prist_ris_loss
+from .models import PriSTRIS, build_model, sample_ris_columns
+from .objectives import prist_ris_loss, temporal_regularized_loss
 from .prior import RidgePrior, file_sha256
 
 
@@ -52,6 +54,8 @@ class TrainingConfig:
     final_refine_blocks: int = 4
     temporal_rank: int = 2
     temporal_residual: bool = True
+    spatial_multiscale_supervision: bool = False
+    spatial_channel_attention: str = "off"
     coordinate_enabled: bool | None = None
     backbone_ris_coordinate_enabled: bool | None = None
     backbone_antenna_index_enabled: bool | None = None
@@ -62,6 +66,10 @@ class TrainingConfig:
     observed_dense_attention_heads: int = 4
     spatial_residual_style: str = "scaled_true_residual"
     temporal_mode: str = "trend"
+    temporal_base_mode: str | None = None
+    temporal_learned_residual_enabled: bool | None = None
+    temporal_delta_loss_weight: float = 0.0
+    temporal_curvature_loss_weight: float = 0.0
     learning_rate: float = 5e-4
     weight_decay: float = 1e-5
     epochs: int = 30
@@ -75,13 +83,19 @@ class TrainingConfig:
     architecture_version: str = ARCHITECTURE_VERSION
     spatial_protocol_version: str = SPATIAL_PROTOCOL_VERSION
     position_semantics_version: str = POSITION_SEMANTICS_VERSION
+    spatial_supervision_protocol_version: str = SPATIAL_SUPERVISION_PROTOCOL_VERSION
+    temporal_protocol_version: str = TEMPORAL_PROTOCOL_VERSION
+    test_split_used: bool = False
 
     def normalized(self) -> "TrainingConfig":
         return TrainingConfig(**{**asdict(self), "model_key": canonical_model_key(self.model_key)})
 
 
 def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
-    valid = {"target_only_scratch", "full_finetune", "frozen_spatial", "selective", "full"}
+    valid = {
+        "target_only_scratch", "full_finetune", "frozen_spatial",
+        "selective", "temporal_only", "full",
+    }
     if protocol not in valid:
         raise ValueError(f"Unknown adaptation protocol {protocol!r}.")
     for parameter in model.parameters():
@@ -110,6 +124,11 @@ def configure_adaptation(model: PriSTRIS, protocol: str) -> list[str]:
         if model.temporal is not None:
             for name, parameter in model.temporal.named_parameters():
                 if name.startswith(("anchor_context", "time_encoder", "fusion", "coefficient_head", "alpha_head")):
+                    parameter.requires_grad_(True)
+    elif protocol == "temporal_only":
+        for module in (model.temporal, model.temporal_correction):
+            if module is not None:
+                for parameter in module.parameters():
                     parameter.requires_grad_(True)
     names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     if not names:
@@ -214,6 +233,14 @@ def require_checkpoint_contract(
             f"{purpose} requires position_semantics_version={POSITION_SEMANTICS_VERSION}; "
             f"checkpoint has {state.get('position_semantics_version')!r}."
         )
+    model_key = config.get("model_key") if isinstance(config, dict) else None
+    if model_key == "prist_ris_full" and state.get(
+        "temporal_protocol_version"
+    ) != TEMPORAL_PROTOCOL_VERSION:
+        raise ValueError(
+            f"{purpose} requires temporal_protocol_version={TEMPORAL_PROTOCOL_VERSION} "
+            "for Full checkpoints."
+        )
     if domain != "mobility":
         return
     expected = DataSemantics.for_domain("mobility")
@@ -273,6 +300,44 @@ def load_spatial_pretrained(model: PriSTRIS, state: dict[str, object]) -> dict[s
     }
 
 
+def load_mobility_spatial_reference(
+    model: PriSTRIS, state: dict[str, object]
+) -> dict[str, object]:
+    """Load a compatible Mobility q0/q3 spatial reference into Full."""
+
+    require_checkpoint_contract(
+        state, "Mobility spatial reference", expected_domain="mobility"
+    )
+    source_config = state.get("model_config")
+    if not isinstance(source_config, dict) or source_config.get("model_key") == "prist_ris_full":
+        raise ValueError("Spatial reference must be a q0/q3 Mobility model checkpoint.")
+    current = model.state_dict()
+    source_state = state.get("model_state")
+    if not isinstance(source_state, dict):
+        raise ValueError("Spatial reference checkpoint lacks model_state.")
+    prefixes = (
+        "backbone.", "prior_encoder.", "observed_dense_attention.",
+        "anchor_refiners.", "anchor_heads.",
+    )
+    loaded = {
+        name: value
+        for name, value in source_state.items()
+        if name.startswith(prefixes)
+        and name in current
+        and isinstance(value, torch.Tensor)
+        and value.shape == current[name].shape
+    }
+    if not loaded:
+        raise ValueError("Spatial reference loaded no compatible weights.")
+    current.update(loaded)
+    model.load_state_dict(current)
+    return {
+        "mode": "mobility_spatial_reference",
+        "loaded_keys": sorted(loaded),
+        "source_model_key": source_config.get("model_key"),
+    }
+
+
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f"{path.name}.tmp")
@@ -314,6 +379,7 @@ def train(
     prior_path: str | Path | None = None,
     resume: str | Path | None = None,
     pretrained: str | Path | None = None,
+    spatial_reference: str | Path | None = None,
     command: str | None = None,
     sample_indices: list[int] | None = None,
     stop_after_epoch: int | None = None,
@@ -325,6 +391,16 @@ def train(
         raise ValueError("Training config spatial protocol version mismatch.")
     if config.position_semantics_version != POSITION_SEMANTICS_VERSION:
         raise ValueError("Training config position semantics version mismatch.")
+    if config.spatial_supervision_protocol_version != SPATIAL_SUPERVISION_PROTOCOL_VERSION:
+        raise ValueError("Training config spatial supervision protocol mismatch.")
+    if config.temporal_protocol_version != TEMPORAL_PROTOCOL_VERSION:
+        raise ValueError("Training config temporal protocol mismatch.")
+    if config.test_split_used:
+        raise PermissionError("Training and screening must not use TEST.")
+    if config.temporal_delta_loss_weight < 0 or config.temporal_curvature_loss_weight < 0:
+        raise ValueError("Temporal loss weights must be non-negative.")
+    if config.spatial_multiscale_supervision and config.model_key == "prist_ris_full":
+        raise ValueError("Multi-scale spatial supervision is q0/q3-only in this protocol.")
     if config.mode == "full" and config.amp:
         raise ValueError("Formal PriST-RIS training is FP32; AMP is development-only.")
     if run_dir.exists() and resume is None:
@@ -362,6 +438,8 @@ def train(
         final_refine_blocks=config.final_refine_blocks,
         temporal_rank=config.temporal_rank,
         temporal_residual=config.temporal_residual,
+        spatial_multiscale_supervision=config.spatial_multiscale_supervision,
+        spatial_channel_attention=config.spatial_channel_attention,
         coordinate_enabled=config.coordinate_enabled,
         backbone_ris_coordinate_enabled=config.backbone_ris_coordinate_enabled,
         backbone_antenna_index_enabled=config.backbone_antenna_index_enabled,
@@ -372,9 +450,13 @@ def train(
         observed_dense_attention_heads=config.observed_dense_attention_heads,
         spatial_residual_style=config.spatial_residual_style,
         temporal_mode=config.temporal_mode,
+        temporal_base_mode=config.temporal_base_mode,
+        temporal_learned_residual_enabled=config.temporal_learned_residual_enabled,
         architecture_version=config.architecture_version,
         spatial_protocol_version=config.spatial_protocol_version,
         position_semantics_version=config.position_semantics_version,
+        spatial_supervision_protocol_version=config.spatial_supervision_protocol_version,
+        temporal_protocol_version=config.temporal_protocol_version,
     ).to(device)
     config = TrainingConfig(
         **{
@@ -386,9 +468,13 @@ def train(
             "attention_enabled": model.config.attention_enabled,
             "attention_ris_coordinate_enabled": model.config.attention_ris_coordinate_enabled,
             "attention_antenna_index_enabled": model.config.attention_antenna_index_enabled,
+            "temporal_base_mode": model.config.temporal_base_mode,
+            "temporal_learned_residual_enabled": model.config.temporal_learned_residual_enabled,
         }
     )
     pretrained_metadata = None
+    if pretrained is not None and spatial_reference is not None:
+        raise ValueError("Use either pretrained or spatial_reference, not both.")
     if pretrained is not None:
         source = load_checkpoint(pretrained, device)
         pretrained_metadata = load_spatial_pretrained(model, source)
@@ -398,17 +484,32 @@ def train(
             f"initialized={len(pretrained_metadata['newly_initialized_keys'])}",
             flush=True,
         )
+    if spatial_reference is not None:
+        reference_state = load_checkpoint(spatial_reference, device)
+        pretrained_metadata = load_mobility_spatial_reference(model, reference_state)
     trainable_names = configure_adaptation(model, config.adaptation)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
     start_epoch, best_nmse, stale = 1, float("inf"), 0
+    accumulated_wall_clock_seconds = 0.0
     history: list[dict[str, object]] = []
     validation: dict[str, object] | None = None
     if resume is not None:
         state = load_checkpoint(resume, device)
         require_checkpoint_contract(state, "Resume", expected_domain=config.domain)
-        if state.get("training_config") != asdict(config) or state.get("semantics_hash") != semantics.stable_hash() or state.get("prior_metadata") != prior_metadata:
+        stored_config = state.get("training_config")
+        current_config = asdict(config)
+        compatible_config = isinstance(stored_config, dict)
+        if compatible_config:
+            stored_compare = dict(stored_config)
+            current_compare = dict(current_config)
+            stored_epochs = int(stored_compare.pop("epochs"))
+            current_epochs = int(current_compare.pop("epochs"))
+            compatible_config = (
+                stored_compare == current_compare and current_epochs >= stored_epochs
+            )
+        if not compatible_config or state.get("semantics_hash") != semantics.stable_hash() or state.get("prior_metadata") != prior_metadata:
             raise ValueError("Resume configuration, semantics, or prior metadata mismatch.")
         model.load_state_dict(state["model_state"])
         optimizer.load_state_dict(state["optimizer_state"])
@@ -423,6 +524,9 @@ def train(
         history = list(state.get("history", []))
         stored_validation = state.get("validation")
         validation = stored_validation if isinstance(stored_validation, dict) else None
+        accumulated_wall_clock_seconds = float(
+            state.get("wall_clock_seconds", 0.0)
+        )
     model_protocol = model.protocol_metadata()
     position_metadata = {
         key: model_protocol[key]
@@ -437,8 +541,20 @@ def train(
             "attention_antenna_index_enabled",
             "position_semantics_version",
             "antenna_encoding_semantics",
+            "spatial_multiscale_supervision",
+            "spatial_channel_attention",
+            "spatial_supervision_protocol_version",
+            "temporal_base_mode",
+            "temporal_learned_residual_enabled",
+            "temporal_protocol_version",
         )
     }
+    position_metadata.update(
+        {
+            "temporal_delta_loss_weight": config.temporal_delta_loss_weight,
+            "temporal_curvature_loss_weight": config.temporal_curvature_loss_weight,
+        }
+    )
     resolved_training_config = asdict(config)
     metadata = {
         "method": "PriST-RIS",
@@ -478,27 +594,62 @@ def train(
     while epoch <= call_max_epochs:
         model.train()
         train_total, batches = 0.0, 0
+        component_totals: dict[str, float] = {}
         for raw in train_loader:
             batch = move_batch(raw, device)
             prior_value = prior.predict(batch) if prior is not None else None
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(device_type=device.type, enabled=scaler.is_enabled()):
-                prediction = model(batch, prior_value)
-                prediction, target, _ = _select(
-                    prediction,
-                    batch["target_h"],
-                    config.target_blocks,
-                    tuple(model.output_time_index),
-                )
-                loss, _ = prist_ris_loss(
-                    prediction, target, charbonnier_weight=config.charbonnier_weight
-                )
+                if config.spatial_multiscale_supervision:
+                    predictions = model.spatial_multiscale_anchors(batch, prior_value)
+                    _, target_anchors, _ = _select(
+                        predictions[16],
+                        batch["target_h"],
+                        config.target_blocks,
+                        tuple(model.output_time_index),
+                    )
+                    scale_losses = []
+                    components: dict[str, float] = {}
+                    for width in (4, 8, 16):
+                        scale_loss, _ = prist_ris_loss(
+                            predictions[width],
+                            sample_ris_columns(target_anchors, width),
+                            charbonnier_weight=config.charbonnier_weight,
+                        )
+                        scale_losses.append(scale_loss)
+                        components[f"scale_width{width}"] = float(scale_loss.detach())
+                    loss = torch.stack(scale_losses).mean()
+                    components["total"] = float(loss.detach())
+                else:
+                    prediction = model(batch, prior_value)
+                    prediction, target, selected_times = _select(
+                        prediction,
+                        batch["target_h"],
+                        config.target_blocks,
+                        tuple(model.output_time_index),
+                    )
+                    if selected_times == tuple(range(6)):
+                        loss, components = temporal_regularized_loss(
+                            prediction,
+                            target,
+                            charbonnier_weight=config.charbonnier_weight,
+                            delta_weight=config.temporal_delta_loss_weight,
+                            curvature_weight=config.temporal_curvature_loss_weight,
+                        )
+                    else:
+                        loss, components = prist_ris_loss(
+                            prediction,
+                            target,
+                            charbonnier_weight=config.charbonnier_weight,
+                        )
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(trainable, config.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             train_total += float(loss.detach())
+            for name, value_component in components.items():
+                component_totals[name] = component_totals.get(name, 0.0) + value_component
             batches += 1
         validation = evaluate(
             model,
@@ -520,6 +671,10 @@ def train(
             "validation_nmse_db": validation["nmse_db"],
             "improved": improved,
             "stale_epochs": stale,
+            **{
+                f"train_{name}": total / max(1, batches)
+                for name, total in component_totals.items()
+            },
         }
         history.append(row)
         state = {
@@ -548,6 +703,9 @@ def train(
             "stale_epochs": stale,
             "history": history,
             "validation": validation,
+            "wall_clock_seconds": accumulated_wall_clock_seconds
+            + time.perf_counter()
+            - started,
         }
         save_checkpoint_atomic(checkpoints / "last_checkpoint.pth", state)
         if improved:
@@ -587,7 +745,9 @@ def train(
         "best_validation_nmse_linear": best_nmse,
         "best_validation_nmse_db": 10 * math.log10(max(best_nmse, 1e-12)),
         "epochs_completed": int(history[-1]["epoch"]),
-        "wall_clock_seconds": time.perf_counter() - started,
+        "wall_clock_seconds": accumulated_wall_clock_seconds
+        + time.perf_counter()
+        - started,
         "last_validation": validation,
         "metadata": metadata,
         "test_split_used": False,

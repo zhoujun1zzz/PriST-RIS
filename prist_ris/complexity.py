@@ -12,6 +12,8 @@ from .contracts import (
     MOBILITY_CONTRACT_VERSION,
     POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
+    SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+    TEMPORAL_PROTOCOL_VERSION,
 )
 
 
@@ -79,6 +81,8 @@ def profile_model(
         ),
         "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
         "position_semantics_version": POSITION_SEMANTICS_VERSION,
+        "spatial_supervision_protocol_version": SPATIAL_SUPERVISION_PROTOCOL_VERSION,
+        "temporal_protocol_version": TEMPORAL_PROTOCOL_VERSION,
         "model_key": model.config.model_key,
         "domain": domain,
         "input_shape": list(batch["obs_h"].shape),
@@ -99,10 +103,16 @@ def profile_model(
             else 0
         ),
         "spatial_residual_style": model.config.spatial_residual_style,
+        "spatial_multiscale_supervision": model.config.spatial_multiscale_supervision,
+        "spatial_channel_attention": model.config.spatial_channel_attention,
+        "inference_graph_changed": model.config.spatial_channel_attention != "off",
+        "training_only_mechanism": model.config.spatial_multiscale_supervision,
         "prior_anchors": model.anchor_count if model.uses_prior else 0,
         "spatial_anchor_time_index": list(model.spatial_anchor_time_index),
         "output_time_index": list(model.output_time_index),
         "temporal_rank": model.config.temporal_rank if model.temporal is not None else None,
+        "temporal_base_mode": model.config.temporal_base_mode,
+        "temporal_learned_residual_enabled": model.config.temporal_learned_residual_enabled,
         "parameters": parameters,
         "trainable_parameters": trainable,
         "macs": macs,

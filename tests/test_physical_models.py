@@ -173,7 +173,7 @@ def test_rank_2_and_3_shapes() -> None:
         assert model(batch, prior).shape == (1, 6, 256, 64, 2)
 
 
-def test_temporal_residual_only_changes_non_pilot_queries() -> None:
+def test_temporal_correction_is_exact_identity_at_initialization() -> None:
     torch.manual_seed(12)
     corrected = build_model("prist_ris_full", domain="mobility", **SMALL)
     plain = build_model(
@@ -191,9 +191,11 @@ def test_temporal_residual_only_changes_non_pilot_queries() -> None:
     with_correction = corrected(batch, prior)
     without_correction = plain(batch, prior)
     torch.testing.assert_close(with_correction[:, (0, 3)], without_correction[:, (0, 3)])
-    assert not torch.equal(
+    torch.testing.assert_close(
         with_correction[:, (1, 2, 4, 5)],
         without_correction[:, (1, 2, 4, 5)],
+        rtol=0,
+        atol=0,
     )
 
 
