@@ -12,6 +12,7 @@ from prist_ris.contracts import (
     OBSERVED_RIS_INDICES,
     POSITION_SEMANTICS_VERSION,
     SPATIAL_PROTOCOL_VERSION,
+    TEMPORAL_PROTOCOL_VERSION,
     DataSemantics,
 )
 from prist_ris.engine import (
@@ -347,6 +348,23 @@ def test_spatial_protocol_does_not_invalidate_ridge_only_model_checkpoint() -> N
         "semantics_hash": semantics.stable_hash(),
         "data_semantics": semantics.to_dict(),
     }
+    require_checkpoint_contract(state, "Resume", expected_domain="mobility")
+
+
+def test_full_checkpoint_requires_current_temporal_protocol() -> None:
+    semantics = DataSemantics.for_domain("mobility")
+    state = {
+        "architecture_version": ARCHITECTURE_VERSION,
+        "spatial_protocol_version": SPATIAL_PROTOCOL_VERSION,
+        "position_semantics_version": POSITION_SEMANTICS_VERSION,
+        "mobility_contract_version": "mobility_q0_q3_v1",
+        "model_config": {"domain": "mobility", "model_key": "prist_ris_full"},
+        "semantics_hash": semantics.stable_hash(),
+        "data_semantics": semantics.to_dict(),
+    }
+    with pytest.raises(ValueError, match="temporal_protocol_version"):
+        require_checkpoint_contract(state, "Resume", expected_domain="mobility")
+    state["temporal_protocol_version"] = TEMPORAL_PROTOCOL_VERSION
     require_checkpoint_contract(state, "Resume", expected_domain="mobility")
 
 
