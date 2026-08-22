@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -62,6 +63,13 @@ from .manifests import (
 from .metrics import MetricAccumulator, PerQueryMetricAccumulator
 from .models import build_model
 from .prior import RidgePrior, RidgeStatistics, file_sha256
+from .paper_matrix import (
+    PAPER_PHASES,
+    PAPER_SEEDS,
+    build_paper_matrix_plan,
+    execute_paper_matrix,
+    summarize_paper_matrix,
+)
 from .screening import (
     SPATIAL_MODULE_CANDIDATES,
     SPATIAL_MODULE_REFERENCE_DB,
@@ -862,6 +870,24 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
     allowed = tuple(range(1 if args.domain == "quasi" else 6))
     if not target_blocks or any(value not in allowed for value in target_blocks):
         raise ValueError(f"Invalid target blocks for {args.domain}: {target_blocks}")
+    indices = _indices_from_file(args.sample_index_manifest, args.fraction)
+    if args.fraction is not None and args.sample_index_manifest is None:
+        raise ValueError("--fraction requires --sample-index-manifest for Ridge fitting.")
+    if args.sample_index_manifest is not None:
+        manifest_payload = json.loads(
+            args.sample_index_manifest.read_text(encoding="utf-8")
+        )
+        if int(manifest_payload.get("seed", args.seed)) != args.seed:
+            raise ValueError("Ridge seed does not match the sample-index manifest.")
+        if manifest_payload.get("test_split_used") not in {None, False}:
+            raise PermissionError("Ridge subset manifests must explicitly exclude TEST.")
+    if indices is not None:
+        if len(indices) != len(set(indices)) or any(index < 0 for index in indices):
+            raise ValueError("Ridge sample indices must be unique non-negative values.")
+        if args.domain == "mobility" and any(
+            index >= EXPECTED_MOBILITY_COUNTS["train"] for index in indices
+        ):
+            raise ValueError("Ridge sample index exceeds the Mobility TRAIN range.")
     train_loader = make_loader(
         args.data_root,
         args.domain,
@@ -869,7 +895,8 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
         batch_size=args.batch_size,
         workers=args.workers,
         seed=args.seed,
-        max_samples=args.max_train,
+        max_samples=None if indices is not None else args.max_train,
+        indices=indices,
         shuffle=False,
     )
     validation_loader = make_loader(
@@ -894,6 +921,26 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
         if winner is None or score < winner[0]:
             winner = (score, prior, validation)
     assert winner is not None
+    provenance: dict[str, object] = {
+        "seed": args.seed,
+        "fraction": args.fraction,
+        "sample_count": len(indices) if indices is not None else len(train_loader.dataset),
+        "sample_manifest_sha256": (
+            file_sha256(args.sample_index_manifest)
+            if args.sample_index_manifest is not None
+            else None
+        ),
+        "indices_hash": (
+            hashlib.sha256(
+                json.dumps(indices, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if indices is not None
+            else None
+        ),
+        "selection_split": "validation",
+        "test_split_used": False,
+    }
+    winner[1].provenance = provenance
     artifact = winner[1].save(args.output)
     result = {
         "status": "validation_prior_fit",
@@ -910,6 +957,7 @@ def fit_prior_command(args: argparse.Namespace) -> dict[str, object]:
         "candidates": candidates,
         "selected_validation": winner[2],
         "artifact": artifact,
+        "subset_provenance": provenance,
     }
     _json(Path(args.output).with_suffix(".json"), result)
     print(json.dumps(result, indent=2))
@@ -938,6 +986,12 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
     else:
         max_train, max_validation, default_epochs = None, None, 100
     indices = _indices_from_file(args.sample_index_manifest, args.fraction)
+    if args.sample_index_manifest is not None:
+        sample_manifest_payload = json.loads(
+            args.sample_index_manifest.read_text(encoding="utf-8")
+        )
+        if sample_manifest_payload.get("test_split_used") not in {None, False}:
+            raise PermissionError("Training subset manifests must exclude TEST.")
     if args.anchor_cache_root is not None:
         if (
             args.domain != "mobility"
@@ -1023,6 +1077,8 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         temporal_curvature_loss_weight=args.temporal_curvature_loss_weight,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        scheduler=args.scheduler,
+        min_learning_rate=args.min_learning_rate,
         epochs=args.epochs or default_epochs,
         min_epochs=args.min_epochs,
         patience=args.patience,
@@ -1033,6 +1089,11 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         adaptation=args.adaptation,
     )
     run_name = args.run_name or f"v32_{args.domain}_{key}_{args.mode}_seed{args.seed}_{time.strftime('%Y%m%d_%H%M%S')}"
+    experiment_spec = None
+    if args.experiment_spec is not None:
+        experiment_spec = json.loads(args.experiment_spec.read_text(encoding="utf-8"))
+        if not isinstance(experiment_spec, dict):
+            raise ValueError("--experiment-spec must contain a JSON object.")
     return train(
         config,
         train_loader,
@@ -1045,6 +1106,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         spatial_reference=args.spatial_reference_checkpoint,
         sample_indices=indices,
         stop_after_epoch=args.stop_after_epoch,
+        experiment_spec=experiment_spec,
     )
 
 
@@ -1284,6 +1346,74 @@ def transfer_command(args: argparse.Namespace) -> dict[str, object]:
     return plan
 
 
+def paper_matrix_command(args: argparse.Namespace) -> dict[str, object]:
+    root = Path(args.output_root).resolve()
+    if args.action == "summarize":
+        if args.phase == "all":
+            plans = []
+            for phase in PAPER_PHASES:
+                path = root / f"paper_matrix_plan_{phase.replace('-', '_')}.json"
+                if path.is_file():
+                    plans.append(json.loads(path.read_text(encoding="utf-8")))
+            if not plans:
+                raise FileNotFoundError(
+                    "paper-matrix summarize requires phase-specific plan files."
+                )
+            plan = {
+                **plans[0],
+                "phase": "all",
+                "experiments": [
+                    experiment
+                    for source in plans
+                    for experiment in source["experiments"]
+                ],
+                "prior_jobs": [
+                    job for source in plans for job in source["prior_jobs"]
+                ],
+                "gpu_runs": sum(int(source["gpu_runs"]) for source in plans),
+                "test_split_used": False,
+            }
+        else:
+            plan_path = root / f"paper_matrix_plan_{args.phase.replace('-', '_')}.json"
+            if not plan_path.is_file():
+                raise FileNotFoundError(
+                    f"paper-matrix summarize requires {plan_path.name}."
+                )
+            plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        result = summarize_paper_matrix(
+            root, plan, final_spatial_run=args.final_spatial_run
+        )
+        print(json.dumps(result, indent=2))
+        return result
+    plan = build_paper_matrix_plan(
+        root,
+        phase=args.phase,
+        seeds=args.seeds,
+        project_root=PROJECT,
+    )
+    if args.action == "plan":
+        print(json.dumps(plan, indent=2))
+        return plan
+    execution = execute_paper_matrix(
+        plan,
+        output_root=root,
+        data_root=args.data_root,
+        device=args.device,
+        workers=args.workers,
+        physical_gpu_index=args.physical_gpu_index,
+        confirm_gpu_free=args.confirm_gpu_free,
+        resume_incomplete=args.resume_incomplete,
+        quasi_checkpoint=args.quasi_checkpoint,
+        invoke=lambda arguments: _invoke(arguments, dry_run=False),
+    )
+    summary = summarize_paper_matrix(
+        root, plan, final_spatial_run=args.final_spatial_run
+    )
+    result = {"execution": execution, "summary": summary, "test_split_used": False}
+    print(json.dumps(result, indent=2))
+    return result
+
+
 def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     allow_test = _allowed_test(args)
     device = torch.device(args.device)
@@ -1501,6 +1631,8 @@ def parser() -> argparse.ArgumentParser:
     prior.add_argument("--seed", type=int, default=123)
     prior.add_argument("--max-train", type=int)
     prior.add_argument("--max-validation", type=int)
+    prior.add_argument("--fraction", type=float)
+    prior.add_argument("--sample-index-manifest", type=Path)
     prior.add_argument("--output", type=Path, required=True)
     prior.set_defaults(func=fit_prior_command)
 
@@ -1534,6 +1666,8 @@ def parser() -> argparse.ArgumentParser:
     training.add_argument("--eval-batch-size", type=int, default=48)
     training.add_argument("--learning-rate", type=float, default=5e-4)
     training.add_argument("--weight-decay", type=float, default=1e-5)
+    training.add_argument("--scheduler", choices=("fixed", "cosine"), default="fixed")
+    training.add_argument("--min-learning-rate", type=float, default=5e-6)
     training.add_argument("--epochs", type=int)
     training.add_argument("--min-epochs", type=int, default=40)
     training.add_argument("--patience", type=int, default=15)
@@ -1553,6 +1687,7 @@ def parser() -> argparse.ArgumentParser:
     )
     training.add_argument("--fraction", type=float)
     training.add_argument("--sample-index-manifest", type=Path)
+    training.add_argument("--experiment-spec", type=Path)
     training.add_argument("--stop-after-epoch", type=int, help="Graceful preemption point; does not alter the frozen training config.")
     training.add_argument("--run-name")
     training.add_argument("--output-root", type=Path, default=Path("runs/v3_2_dev"))
@@ -1653,6 +1788,25 @@ def parser() -> argparse.ArgumentParser:
     transfer.add_argument("--study-name")
     transfer.add_argument("--output-root", type=Path, default=Path("runs/transfer"))
     transfer.set_defaults(func=transfer_command)
+
+    paper_matrix = commands.add_parser("paper-matrix")
+    add_runtime_arguments(paper_matrix)
+    paper_matrix.add_argument(
+        "--action", choices=("plan", "run", "summarize"), required=True
+    )
+    paper_matrix.add_argument(
+        "--phase", choices=PAPER_PHASES + ("all",), default="all"
+    )
+    paper_matrix.add_argument("--seeds", type=csv_ints, default=PAPER_SEEDS)
+    paper_matrix.add_argument("--quasi-checkpoint", type=Path)
+    paper_matrix.add_argument("--final-spatial-run", type=Path)
+    paper_matrix.add_argument("--physical-gpu-index", type=int, default=3)
+    paper_matrix.add_argument("--confirm-gpu-free", action="store_true")
+    paper_matrix.add_argument("--resume-incomplete", action="store_true")
+    paper_matrix.add_argument(
+        "--output-root", type=Path, default=Path("runs/paper_matrix")
+    )
+    paper_matrix.set_defaults(func=paper_matrix_command)
 
     evaluation = commands.add_parser("evaluate")
     add_runtime_arguments(evaluation)

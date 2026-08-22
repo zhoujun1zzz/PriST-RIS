@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import math
 import random
@@ -72,6 +73,8 @@ class TrainingConfig:
     temporal_curvature_loss_weight: float = 0.0
     learning_rate: float = 5e-4
     weight_decay: float = 1e-5
+    scheduler: str = "fixed"
+    min_learning_rate: float = 5e-6
     epochs: int = 30
     min_epochs: int = 1
     patience: int = 15
@@ -383,6 +386,7 @@ def train(
     command: str | None = None,
     sample_indices: list[int] | None = None,
     stop_after_epoch: int | None = None,
+    experiment_spec: dict[str, object] | None = None,
 ) -> dict[str, object]:
     config = config.normalized()
     if config.architecture_version != ARCHITECTURE_VERSION:
@@ -399,6 +403,10 @@ def train(
         raise PermissionError("Training and screening must not use TEST.")
     if config.temporal_delta_loss_weight < 0 or config.temporal_curvature_loss_weight < 0:
         raise ValueError("Temporal loss weights must be non-negative.")
+    if config.scheduler not in {"fixed", "cosine"}:
+        raise ValueError("Training scheduler must be fixed or cosine.")
+    if not 0 <= config.min_learning_rate <= config.learning_rate:
+        raise ValueError("min_learning_rate must be in [0, learning_rate].")
     if config.spatial_multiscale_supervision and config.model_key == "prist_ris_full":
         raise ValueError("Multi-scale spatial supervision is q0/q3-only in this protocol.")
     if config.mode == "full" and config.amp:
@@ -406,6 +414,24 @@ def train(
     if run_dir.exists() and resume is None:
         raise FileExistsError(f"Run directory already exists: {run_dir}")
     run_dir.mkdir(parents=True, exist_ok=True)
+    experiment_spec_hash = None
+    if experiment_spec is not None:
+        if experiment_spec.get("test_split_used") is not False:
+            raise PermissionError("Paper experiment specs must explicitly exclude TEST.")
+        serialized_spec = json.dumps(
+            experiment_spec, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        )
+        experiment_spec_hash = hashlib.sha256(
+            serialized_spec.encode("utf-8")
+        ).hexdigest()
+        recorded_spec_path = run_dir / "paper_experiment_spec.json"
+        if recorded_spec_path.is_file():
+            if json.loads(recorded_spec_path.read_text(encoding="utf-8")) != experiment_spec:
+                raise ValueError("Paper experiment spec mismatch for existing run.")
+        elif resume is not None:
+            raise ValueError("Resuming a paper run requires its recorded exact spec.")
+        else:
+            _write_json(recorded_spec_path, experiment_spec)
     checkpoints = run_dir / "checkpoints"
     results = run_dir / "results"
     manifests = run_dir / "manifests"
@@ -490,6 +516,13 @@ def train(
     trainable_names = configure_adaptation(model, config.adaptation)
     trainable = [parameter for parameter in model.parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW(trainable, lr=config.learning_rate, weight_decay=config.weight_decay)
+    scheduler = (
+        torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=config.epochs, eta_min=config.min_learning_rate
+        )
+        if config.scheduler == "cosine"
+        else None
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=config.amp and device.type == "cuda")
     start_epoch, best_nmse, stale = 1, float("inf"), 0
     accumulated_wall_clock_seconds = 0.0
@@ -504,15 +537,29 @@ def train(
         if compatible_config:
             stored_compare = dict(stored_config)
             current_compare = dict(current_config)
+            # Checkpoints written before scheduler/timing support are fixed-LR
+            # runs. Preserve their default resume compatibility.
+            stored_compare.setdefault("scheduler", "fixed")
+            stored_compare.setdefault("min_learning_rate", 5e-6)
+            stored_compare.setdefault("test_split_used", False)
             stored_epochs = int(stored_compare.pop("epochs"))
             current_epochs = int(current_compare.pop("epochs"))
             compatible_config = (
-                stored_compare == current_compare and current_epochs >= stored_epochs
+                stored_compare == current_compare
+                and current_epochs >= stored_epochs
+                and (config.scheduler == "fixed" or current_epochs == stored_epochs)
             )
         if not compatible_config or state.get("semantics_hash") != semantics.stable_hash() or state.get("prior_metadata") != prior_metadata:
             raise ValueError("Resume configuration, semantics, or prior metadata mismatch.")
+        if state.get("experiment_spec_hash") != experiment_spec_hash:
+            raise ValueError("Resume paper experiment spec hash mismatch.")
         model.load_state_dict(state["model_state"])
         optimizer.load_state_dict(state["optimizer_state"])
+        if scheduler is not None:
+            scheduler_state = state.get("scheduler_state")
+            if not isinstance(scheduler_state, dict):
+                raise ValueError("Cosine resume checkpoint lacks scheduler_state.")
+            scheduler.load_state_dict(scheduler_state)
         restore_rng_state(state["rng_state"])
         generator = _loader_generator(train_loader)
         generator_state = state.get("train_loader_generator_state")
@@ -580,6 +627,7 @@ def train(
         "top_level_trainable_modules": sorted({name.split(".")[0] for name in trainable_names}),
         "model_protocol": model_protocol,
         "test_split_used": False,
+        "experiment_spec_hash": experiment_spec_hash,
     }
     (run_dir / "command.txt").write_text(command or shlex.join(sys.argv), encoding="utf-8")
     _write_json(run_dir / "config.json", resolved_training_config)
@@ -592,6 +640,8 @@ def train(
     started = time.perf_counter()
     epoch = start_epoch
     while epoch <= call_max_epochs:
+        epoch_started = time.perf_counter()
+        epoch_learning_rate = float(optimizer.param_groups[0]["lr"])
         model.train()
         train_total, batches = 0.0, 0
         component_totals: dict[str, float] = {}
@@ -659,6 +709,10 @@ def train(
             target_blocks=config.target_blocks,
         )
         value = float(validation["nmse_linear"])
+        epoch_seconds = time.perf_counter() - epoch_started
+        wall_clock_seconds = (
+            accumulated_wall_clock_seconds + time.perf_counter() - started
+        )
         improved = value < best_nmse
         if improved:
             best_nmse, stale = value, 0
@@ -671,17 +725,23 @@ def train(
             "validation_nmse_db": validation["nmse_db"],
             "improved": improved,
             "stale_epochs": stale,
+            "learning_rate": epoch_learning_rate,
+            "epoch_seconds": epoch_seconds,
+            "wall_clock_seconds": wall_clock_seconds,
             **{
                 f"train_{name}": total / max(1, batches)
                 for name, total in component_totals.items()
             },
         }
         history.append(row)
+        if scheduler is not None:
+            scheduler.step()
         state = {
             "method": "PriST-RIS",
             "architecture_version": ARCHITECTURE_VERSION,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
+            "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
             "epoch": epoch,
             "best_validation_nmse_linear": best_nmse,
             "training_config": resolved_training_config,
@@ -703,9 +763,8 @@ def train(
             "stale_epochs": stale,
             "history": history,
             "validation": validation,
-            "wall_clock_seconds": accumulated_wall_clock_seconds
-            + time.perf_counter()
-            - started,
+            "experiment_spec_hash": experiment_spec_hash,
+            "wall_clock_seconds": wall_clock_seconds,
         }
         save_checkpoint_atomic(checkpoints / "last_checkpoint.pth", state)
         if improved:

@@ -121,6 +121,7 @@ def profile_model(
         "gflops": 2 * macs / 1e9,
         "latency_ms_batch1": latency_ms,
         "peak_gpu_memory_bytes": peak,
+        "test_split_used": False,
         "convention": (
             "batch1 FP32 single forward; Conv2d/Conv3d, linear, "
             "per-antenna observed-to-dense attention, and complex low-rank "

@@ -94,6 +94,7 @@ class RidgePrior:
     target_blocks: tuple[int, ...]
     semantics_hash: str
     fit_split: str = "train"
+    provenance: dict[str, object] | None = None
 
     def predict(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         observed = _complex(batch["obs_h"])
@@ -106,7 +107,7 @@ class RidgePrior:
         return torch.stack((output.real, output.imag), dim=-1).to(batch["obs_h"].dtype)
 
     def metadata(self) -> dict[str, object]:
-        return {
+        metadata = {
             "regularization": self.regularization,
             "fit_rows": self.rows,
             "fit_split": self.fit_split,
@@ -114,6 +115,9 @@ class RidgePrior:
             "semantics_hash": self.semantics_hash,
             "coefficient_shape": list(self.coefficients.shape),
         }
+        if self.provenance:
+            metadata.update(self.provenance)
+        return metadata
 
     def save(self, path: str | Path) -> dict[str, object]:
         destination = Path(path).expanduser().resolve()
@@ -134,6 +138,10 @@ class RidgePrior:
         with np.load(source, allow_pickle=False) as artifact:
             coefficients = artifact["coefficients"]
             metadata = json.loads(str(artifact["metadata"].item()))
+        base_keys = {
+            "regularization", "fit_rows", "fit_split", "target_blocks",
+            "semantics_hash", "coefficient_shape",
+        }
         return cls(
             coefficients=coefficients,
             regularization=float(metadata["regularization"]),
@@ -141,6 +149,7 @@ class RidgePrior:
             target_blocks=tuple(int(v) for v in metadata["target_blocks"]),
             semantics_hash=str(metadata["semantics_hash"]),
             fit_split=str(metadata["fit_split"]),
+            provenance={key: value for key, value in metadata.items() if key not in base_keys},
         )
 
 
