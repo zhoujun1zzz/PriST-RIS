@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -121,6 +123,46 @@ def test_resume_is_bitwise_deterministic(tmp_path: Path) -> None:
     second = load_checkpoint(resumed / "checkpoints" / "last_checkpoint.pth", torch.device("cpu"))
     for name, value in first["model_state"].items():
         torch.testing.assert_close(value, second["model_state"][name], rtol=0, atol=0)
+
+
+def test_cosine_resume_records_continuous_epoch_and_wall_timing(tmp_path: Path) -> None:
+    config = replace(
+        _config(epochs=3),
+        scheduler="cosine",
+        learning_rate=1e-3,
+        min_learning_rate=1e-5,
+    )
+    run = tmp_path / "cosine"
+    train(
+        config,
+        _loader(),
+        _loader(),
+        run_dir=run,
+        device=torch.device("cpu"),
+        stop_after_epoch=1,
+    )
+    train(
+        config,
+        _loader(),
+        _loader(),
+        run_dir=run,
+        device=torch.device("cpu"),
+        resume=run / "checkpoints" / "last_checkpoint.pth",
+    )
+    with (run / "results" / "training_history.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as handle:
+        history = list(csv.DictReader(handle))
+    assert len(history) == 3
+    assert all(float(row["epoch_seconds"]) > 0 for row in history)
+    assert [float(row["wall_clock_seconds"]) for row in history] == sorted(
+        float(row["wall_clock_seconds"]) for row in history
+    )
+    assert float(history[0]["learning_rate"]) > float(history[-1]["learning_rate"])
+    state = load_checkpoint(
+        run / "checkpoints" / "last_checkpoint.pth", torch.device("cpu")
+    )
+    assert state["scheduler_state"] is not None
 
 
 def test_legacy_checkpoint_is_rejected_by_version_guard() -> None:

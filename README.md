@@ -120,3 +120,14 @@ prist-ris cache-spatial-anchors --checkpoint "$SPATIAL_CHECKPOINT" \
 Both runners execute candidates serially for exactly 30 epochs. A candidate extends to 40 when its best epoch is at least 26, or when epoch 21 to 30 improves by at least 0.05 dB and its best score is within 0.30 dB of the fixed reference. A 100-epoch continuation is only recommended when the 40-epoch best is at or after epoch 36 or within 0.10 dB of the reference; it runs only with `--run-long-followups`. TEST is never opened by these workflows, the supplied Ridge artifact is never refit, completed runs are reused, and incomplete runs are never overwritten.
 
 See [the unified screening protocol](docs/unified_module_screening.md) and [the GPU3 serial launcher](scripts/run_unified_screening_gpu3.sh) for exact execution commands.
+
+## Paper experiment matrix
+
+The validation-only paper framework generates deterministic data-efficiency and low-shot transfer plans without starting training:
+
+```bash
+prist-ris paper-matrix --action plan --phase data-efficiency --seeds 123
+prist-ris paper-matrix --action plan --phase transfer --seeds 123
+```
+
+It binds Direct/Prior models to identical nested TRAIN subsets, fits each Ridge baseline from the same allowed fraction, records resumable cosine timing, and produces paper-ready JSON/CSV summaries. Formal execution remains an explicit later action and TEST stays locked. See [the paper experiment matrix protocol](docs/paper_experiment_matrix.md).
