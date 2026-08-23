@@ -10,9 +10,11 @@ Lite-A.
 V1 contains exactly one candidate, TL24:
 
 - Lite-A spatial backbone: hidden 32, blocks 2/2/1, final refine 1;
-- full-data Prior-S3 with direct-add RIS coordinates and SE;
+- the full-data prior-guided Lite-A spatial model with direct-add RIS
+  coordinates and SE;
 - independent temporal hidden 24;
-- deterministic linear-trend base plus learned rank-2 residual;
+- deterministic linear-trend base plus a learned bounded trend-coefficient
+  correction and rank-2 complex residual;
 - no `FutureResidualCorrection`;
 - no delta or curvature auxiliary loss;
 - no architecture, width, rank, loss, or scheduler search.
@@ -20,6 +22,24 @@ V1 contains exactly one candidate, TL24:
 The new `temporal_hidden` setting is backward compatible. When absent or null,
 the effective temporal width remains equal to spatial `hidden`, preserving old
 Full checkpoint state-dict shapes and numerical semantics.
+
+Lite-A is not the hidden-80 Prior-S3 model. It retains the RIS-coordinate and
+SE mechanisms selected during the full-model spatial study, but uses the frozen
+Lite-A hidden-32, blocks-2/2/1 architecture.
+
+For a non-pilot time `t`, TL24 implements
+
+```text
+H_hat_t = A0
+          + (alpha_t + Delta_alpha_phi(t)) (A3 - A0)
+          + sum_{r=1}^2 c_phi,r(t) B_phi,r
+```
+
+where `alpha_t` is the deterministic normalized time coordinate and
+`Delta_alpha_phi(t) = 0.25 * tanh(alpha_head(...))`. In the compact paper form
+`H_hat_t = H_trend_t + R_phi(t)`, the learned correction is
+`R_phi(t) = Delta_alpha_phi(t)(A3-A0) + sum c_phi,r(t)B_phi,r`; it is not only
+the rank-2 basis term.
 
 ## Provenance and complexity gates
 
@@ -32,10 +52,19 @@ Planning validates all of the following before producing commands:
 - `test_split_used=false` throughout.
 
 Planning runs only on CPU. It loads the Lite-A checkpoint into a real
-`prist_ris_full` graph and profiles batch-1 FP32 q0-q5 inference. Training is
-blocked unless total parameters are below 1,112,904 and end-to-end GMAC are
-below 6.337769472. A failed gate stops for human review; it never changes width
-24 or starts a search automatically.
+`prist_ris_full` graph and profiles batch-1 FP32 q0-q5 inference. Historical
+`parameters`, `macs`, `gmacs`, `flops`, and `gflops` retain their neural-only
+meaning. Temporal-Lite additionally derives Ridge storage and compute from the
+validated artifact's complex coefficient shape and the canonical Mobility
+input shape.
+
+One complex Ridge coefficient counts as two real scalar parameter equivalents;
+one complex multiply-accumulate counts as four real MACs. The budget gate uses
+`total_parameter_real_equivalents = neural_parameters +
+prior_parameter_real_equivalents` and `total_gmacs = neural_gmacs +
+prior_gmacs`. Training is blocked unless these totals are below 1,112,904 and
+6.337769472 respectively. A failed gate stops for human review; it never
+changes width 24 or starts a search automatically.
 
 ## Formal execution
 
@@ -73,9 +102,13 @@ No command reads TEST. No formal training starts during planning.
 
 Summaries report T1-Lite and TL24 q0-q5 VALIDATION diagnostics, including
 anchor, non-pilot, interpolation, extrapolation, delta, and curvature errors.
-TL24 also records best/last epochs, wall time, end-to-end complexity, LPAN-L
-budget status, and performance gaps versus the declared LPAN-L, LPAN, and Full
-Direct-S3+T2 references. `winner` remains null and selection is human-only.
+TL24 also records best/last epochs, wall time, neural-only and Ridge-inclusive
+complexity, LPAN-L budget status, and performance gaps versus the declared
+LPAN-L, LPAN, and
+`Direct_S3_T2_cache_composed_validation_seed123` references. The latter is a
+VALIDATION-only cache composition used solely as a performance-gap reference;
+it is not a validated standard end-to-end deployable Direct Full checkpoint.
+`winner` remains null and selection is human-only.
 
 Expected layout:
 

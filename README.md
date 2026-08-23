@@ -165,9 +165,10 @@ No Lite command opens TEST or modifies Temporal T2. See
 ## PriST-RIS Temporal-Lite V1
 
 Temporal-Lite is a single predeclared TL24 compression check built on the
-full-data Lite-A spatial checkpoint. Spatial width remains 32 while the learned
-rank-2 trend residual uses an independent temporal width of 24. The deterministic
-linear trend is unchanged and the optional future residual correction is off.
+full-data prior-guided Lite-A spatial model. Spatial width remains 32 while the
+learned bounded trend-coefficient correction and rank-2 complex residual use an
+independent temporal width of 24. The deterministic linear trend is unchanged
+and the optional future residual correction is off.
 
 Planning is CPU-only and requires the exact seed-123 full TRAIN manifest, its
 fraction-matched Ridge artifact, and an exact Lite-A full-data checkpoint:
@@ -180,9 +181,10 @@ prist-ris temporal-lite --action plan \
   --output-root runs/temporal_lite_v1
 ```
 
-The plan profiles the complete q0-q5 deployment graph before training. TL24 is
-blocked unless both total parameters and end-to-end GMAC are strictly below the
-LPAN-L budgets. A formal run then builds or reuses TRAIN/VALIDATION-only anchor
-caches, evaluates T1-Lite, trains TL24 serially, and evaluates the exact best
-checkpoint through the uncached raw-input deployment path. See
+The plan preserves the historical neural-only profile fields, then separately
+counts Ridge coefficient storage and raw-observation Ridge MACs. TL24 is blocked
+unless the resulting total real-scalar parameter equivalents and total q0-q5
+GMAC are strictly below the LPAN-L budgets. A formal run then builds or reuses
+TRAIN/VALIDATION-only anchor caches, evaluates T1-Lite, trains TL24 serially,
+and evaluates the exact best checkpoint through the uncached raw-input path. See
 [the Temporal-Lite V1 protocol](docs/temporal_lite_v1.md).
