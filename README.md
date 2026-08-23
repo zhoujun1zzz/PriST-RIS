@@ -131,3 +131,33 @@ prist-ris paper-matrix --action plan --phase transfer --seeds 123
 ```
 
 It binds Direct/Prior models to identical nested TRAIN subsets, fits each Ridge baseline from the same allowed fraction, records resumable cosine timing, and produces paper-ready JSON/CSV summaries. Formal execution remains an explicit later action and TEST stays locked. See [the paper experiment matrix protocol](docs/paper_experiment_matrix.md).
+
+## PriST-RIS-Lite V1 screening
+
+The Lite workflow is a fixed two-candidate spatial compression check, not a new
+architecture search. It leaves the frozen S3 and paper-matrix configurations
+unchanged. Planning validates the seed-123 canonical nested 25% TRAIN manifest
+and the Ridge prior fitted from exactly those 5,000 samples, then profiles
+Lite-A (`hidden=32`) and Lite-B (`hidden=40`) on CPU:
+
+```bash
+prist-ris lite-screen --action plan \
+  --sample-index-manifest "$SAMPLE_MANIFEST" --prior "$PRIOR_25" \
+  --data-root "$PRIST_RIS_DATA_ROOT" \
+  --output-root runs/lite_screening_v1
+```
+
+Formal execution is explicitly separate, serial, FP32, and one GPU only:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0
+prist-ris lite-screen --action run \
+  --sample-index-manifest "$SAMPLE_MANIFEST" --prior "$PRIOR_25" \
+  --data-root "$PRIST_RIS_DATA_ROOT" --device cuda:0 --workers 8 \
+  --physical-gpu-index 0 --confirm-gpu-free \
+  --output-root runs/lite_screening_v1
+```
+
+Summaries report both candidates and Pareto dominance but never choose a winner.
+No Lite command opens TEST or modifies Temporal T2. See
+[the Lite V1 protocol](docs/lite_screening_v1.md).
