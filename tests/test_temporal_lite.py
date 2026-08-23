@@ -17,12 +17,15 @@ from prist_ris.contracts import (
     DataSemantics,
 )
 from prist_ris.engine import load_mobility_spatial_reference
+from prist_ris.complexity import profile_model
 from prist_ris.models import build_model, canonical_batch
 from prist_ris.paper_matrix import indices_hash
 from prist_ris.prior import RidgePrior, file_sha256
 from prist_ris.temporal_lite import (
     LPAN_L_GMACS,
     LPAN_L_PARAMETERS,
+    REFERENCE_METADATA,
+    REFERENCE_NMSE_DB,
     TEMPORAL_LITE_TRAIN_COUNT,
     TL24,
     build_temporal_lite_plan,
@@ -32,6 +35,7 @@ from prist_ris.temporal_lite import (
     execute_temporal_lite_plan,
     fixed_tl24_training_config,
     profile_temporal_lite,
+    profile_ridge_complexity,
     summarize_temporal_lite,
     validate_full_prior,
     validate_full_sample_manifest,
@@ -215,10 +219,16 @@ def test_full_manifest_prior_and_checkpoint_provenance_are_strict(
 
 
 def test_tl24_cpu_profile_is_end_to_end_and_budgeted(tmp_path: Path) -> None:
-    _, _, checkpoint = _artifacts(tmp_path)
+    manifest_path, prior, checkpoint = _artifacts(tmp_path)
+    manifest = validate_full_sample_manifest(manifest_path)
+    validated_prior = validate_full_prior(prior, manifest)
     profiles = profile_temporal_lite(
-        tmp_path / "profile", spatial_checkpoint=checkpoint
+        tmp_path / "profile",
+        spatial_checkpoint=checkpoint,
+        prior_path=prior,
+        validated_prior=validated_prior,
     )
+    t1 = profiles["T1-Lite"]
     tl24 = profiles["TL24"]
     assert tl24["target_scope"] == "mobility_q0_q5_end_to_end"
     assert tl24["output_shape"] == [1, 6, 256, 64, 2]
@@ -226,10 +236,62 @@ def test_tl24_cpu_profile_is_end_to_end_and_budgeted(tmp_path: Path) -> None:
     assert tl24["temporal_hidden"] == 24
     assert tl24["temporal_rank"] == 2
     assert tl24["temporal_residual_enabled"] is False
-    assert tl24["parameters"] < LPAN_L_PARAMETERS
-    assert tl24["gmacs"] < LPAN_L_GMACS
+    assert tl24["parameters"] == tl24["neural_parameters"] == 524301
+    assert tl24["gmacs"] == tl24["neural_gmacs"] == pytest.approx(6.133700016)
+    assert tl24["prior_coefficient_shape"] == [64, 512]
+    assert tl24["prior_complex_parameters"] == 32768
+    assert tl24["prior_parameter_real_equivalents"] == 65536
+    assert tl24["prior_real_macs"] == 8388608
+    assert tl24["prior_gmacs"] == pytest.approx(0.008388608)
+    assert tl24["total_parameter_real_equivalents"] == 589837
+    assert tl24["total_real_macs"] == 6142088624
+    assert tl24["total_gmacs"] == pytest.approx(6.142088624)
+    assert tl24["total_gflops"] == pytest.approx(12.284177248)
+    assert tl24["total_parameter_real_equivalents"] < LPAN_L_PARAMETERS
+    assert tl24["total_gmacs"] < LPAN_L_GMACS
+    assert LPAN_L_PARAMETERS - tl24["total_parameter_real_equivalents"] == 523067
+    assert LPAN_L_GMACS - tl24["total_gmacs"] == pytest.approx(0.195680848)
     assert tl24["budget_pass"] is True
     assert tl24["test_split_used"] is False
+    assert t1["neural_parameters"] == 452364
+    assert t1["prior_parameter_real_equivalents"] == 65536
+    assert t1["total_parameter_real_equivalents"] == 517900
+    assert t1["neural_gmacs"] == pytest.approx(5.048664064)
+    assert t1["prior_gmacs"] == pytest.approx(0.008388608)
+    assert t1["total_gmacs"] == pytest.approx(5.057052672)
+    assert t1["total_gflops"] == pytest.approx(10.114105344)
+
+
+def test_ridge_complexity_fails_closed_on_noncanonical_coefficients() -> None:
+    prior = RidgePrior(
+        coefficients=np.zeros((63, 512), dtype=np.complex128),
+        regularization=1e-4,
+        rows=1,
+        target_blocks=(0, 3),
+        semantics_hash=DataSemantics.for_domain("mobility").stable_hash(),
+    )
+    with pytest.raises(ValueError, match="coefficient shape mismatch"):
+        profile_ridge_complexity(prior, [1, 2, 32, 64, 2])
+
+
+def test_generic_profile_model_keeps_neural_only_semantics() -> None:
+    result = profile_model(
+        build_tl24_model(),
+        domain="mobility",
+        device=torch.device("cpu"),
+        latency_runs=1,
+    )
+    assert result["parameters"] == 524301
+    assert result["gmacs"] == pytest.approx(6.133700016)
+    for total_only in (
+        "neural_parameters",
+        "prior_complex_parameters",
+        "prior_parameter_real_equivalents",
+        "prior_gmacs",
+        "total_parameter_real_equivalents",
+        "total_gmacs",
+    ):
+        assert total_only not in result
 
 
 def test_plan_is_fixed_cpu_only_and_uses_canonical_run_directory(
@@ -279,6 +341,48 @@ def test_budget_failure_blocks_before_gpu_or_invocation() -> None:
     assert invoked == []
 
 
+def test_neural_pass_but_total_fail_blocks_gpu_training() -> None:
+    invoked: list[list[object]] = []
+    with pytest.raises(RuntimeError, match="invalid TL24 profile evidence"):
+        execute_temporal_lite_plan(
+            {
+                "test_split_used": False,
+                "complexity_budget": {"budget_pass": True},
+                "profiles": {
+                    "TL24": {
+                        "parameters": 524301,
+                        "gmacs": 6.133700016,
+                        "neural_parameters": 524301,
+                        "prior_parameter_real_equivalents": 588604,
+                        "total_parameter_real_equivalents": LPAN_L_PARAMETERS + 1,
+                        "macs": 6133700016,
+                        "neural_macs": 6133700016,
+                        "prior_real_macs": 8388608,
+                        "prior_gmacs": 0.008388608,
+                        "prior_complex_parameters": 294302,
+                        "total_real_macs": 6142088624,
+                        "total_gmacs": 6.142088624,
+                        "total_real_flops": 12284177248,
+                        "total_gflops": 12.284177248,
+                        "parameter_budget_pass": False,
+                        "gmac_budget_pass": True,
+                        "budget_pass": False,
+                        "target_scope": "mobility_q0_q5_end_to_end",
+                        "test_split_used": False,
+                    }
+                },
+            },
+            data_root="data",
+            device="cuda:0",
+            workers=8,
+            physical_gpu_index=0,
+            confirm_gpu_free=True,
+            resume_incomplete=False,
+            invoke=invoked.append,
+        )
+    assert invoked == []
+
+
 def test_gpu_preflight_rejects_wrong_visible_device(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -288,6 +392,21 @@ def test_gpu_preflight_rejects_wrong_visible_device(
         "TL24": {
             "parameters": 524301,
             "gmacs": 6.133700016,
+            "neural_parameters": 524301,
+            "prior_parameter_real_equivalents": 65536,
+            "total_parameter_real_equivalents": 589837,
+            "macs": 6133700016,
+            "neural_macs": 6133700016,
+            "prior_real_macs": 8388608,
+            "prior_gmacs": 0.008388608,
+            "prior_complex_parameters": 32768,
+            "total_real_macs": 6142088624,
+            "total_gmacs": 6.142088624,
+            "total_real_flops": 12284177248,
+            "total_gflops": 12.284177248,
+            "parameter_budget_pass": True,
+            "gmac_budget_pass": True,
+            "budget_pass": True,
             "target_scope": "mobility_q0_q5_end_to_end",
             "test_split_used": False,
         }
@@ -357,12 +476,28 @@ def test_summary_reports_t1_tl24_gaps_and_no_winner(tmp_path: Path) -> None:
             "trainable_parameters": 0,
             "gmacs": 5.0,
             "gflops": 10.0,
+            "neural_parameters": 452364,
+            "neural_gmacs": 5.0,
+            "prior_complex_parameters": 32768,
+            "prior_parameter_real_equivalents": 65536,
+            "prior_gmacs": 0.008388608,
+            "total_parameter_real_equivalents": 517900,
+            "total_gmacs": 5.008388608,
+            "total_gflops": 10.016777216,
         },
         "TL24": {
             "parameters": 520000,
             "trainable_parameters": 68000,
             "gmacs": 6.1,
             "gflops": 12.2,
+            "neural_parameters": 520000,
+            "neural_gmacs": 6.1,
+            "prior_complex_parameters": 32768,
+            "prior_parameter_real_equivalents": 65536,
+            "prior_gmacs": 0.008388608,
+            "total_parameter_real_equivalents": 585536,
+            "total_gmacs": 6.108388608,
+            "total_gflops": 12.216777216,
             "budget_pass": True,
         },
     }
@@ -429,3 +564,25 @@ def test_summary_reports_t1_tl24_gaps_and_no_winner(tmp_path: Path) -> None:
     assert summary["winner"] is None
     assert summary["human_decision_only"] is True
     assert summary["test_split_used"] is False
+    assert "Full_Direct_S3_T2_seed123" not in REFERENCE_NMSE_DB
+    reference = "Direct_S3_T2_cache_composed_validation_seed123"
+    assert REFERENCE_NMSE_DB[reference] == -21.992708
+    assert REFERENCE_METADATA[reference]["split"] == "validation"
+    assert "cached Direct-S3" in REFERENCE_METADATA[reference]["composition"]
+    assert REFERENCE_METADATA[reference]["purpose"] == "performance gap reference only"
+    assert REFERENCE_METADATA[reference][
+        "standard_end_to_end_deployable_checkpoint_validated"
+    ] is False
+
+
+def test_temporal_lite_terminology_and_formula_are_unambiguous() -> None:
+    project = Path(__file__).resolve().parents[1]
+    documentation = (project / "docs" / "temporal_lite_v1.md").read_text(
+        encoding="utf-8"
+    )
+    readme = (project / "README.md").read_text(encoding="utf-8")
+    combined = documentation + readme
+    assert "full-data Prior-S3" not in combined
+    assert "full-data prior-guided Lite-A spatial model" in documentation
+    assert "bounded trend-coefficient correction" in combined
+    assert "Direct_S3_T2_cache_composed_validation_seed123" in documentation

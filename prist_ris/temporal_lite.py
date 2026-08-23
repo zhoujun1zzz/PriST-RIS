@@ -14,7 +14,13 @@ import torch
 from .anchor_cache import read_anchor_cache_metadata
 from .checkpoint import load_checkpoint
 from .complexity import profile_model
-from .contracts import DataSemantics
+from .contracts import (
+    ANTENNAS,
+    GRID_HEIGHT,
+    GRID_WIDTH,
+    OBSERVED_RIS_INDICES,
+    DataSemantics,
+)
 from .engine import (
     configure_adaptation,
     load_mobility_spatial_reference,
@@ -22,7 +28,7 @@ from .engine import (
 )
 from .models import PriSTRIS, build_model
 from .paper_matrix import gpu_preflight, indices_hash, validate_prior_artifact
-from .prior import file_sha256
+from .prior import RidgePrior, file_sha256
 
 
 TEMPORAL_LITE_SCHEMA = "prist_ris.temporal_lite.v1"
@@ -35,7 +41,15 @@ LPAN_L_GMACS = 6.337769472
 REFERENCE_NMSE_DB = {
     "LPAN-L_mean": -21.074314,
     "LPAN_mean": -21.768841,
-    "Full_Direct_S3_T2_seed123": -21.992708,
+    "Direct_S3_T2_cache_composed_validation_seed123": -21.992708,
+}
+REFERENCE_METADATA = {
+    "Direct_S3_T2_cache_composed_validation_seed123": {
+        "split": "validation",
+        "composition": "cached Direct-S3 spatial anchors plus T2 temporal model",
+        "purpose": "performance gap reference only",
+        "standard_end_to_end_deployable_checkpoint_validated": False,
+    }
 }
 
 
@@ -281,15 +295,85 @@ def _load_spatial_reference(model: PriSTRIS, checkpoint_path: str | Path) -> Non
     load_mobility_spatial_reference(model, state)
 
 
+def profile_ridge_complexity(
+    prior: RidgePrior, input_shape: list[int] | tuple[int, ...]
+) -> dict[str, object]:
+    """Count the validated Mobility Ridge as real-scalar storage and real MACs."""
+
+    shape = tuple(int(value) for value in input_shape)
+    semantics = DataSemantics.for_domain("mobility")
+    expected_input_shape = (
+        1,
+        len(semantics.obs_time_index),
+        len(OBSERVED_RIS_INDICES),
+        ANTENNAS,
+        2,
+    )
+    if shape != expected_input_shape:
+        raise ValueError(
+            f"Temporal-Lite Ridge profile requires input {expected_input_shape}, got {shape}."
+        )
+    if prior.semantics_hash != semantics.stable_hash() or prior.target_blocks != (0, 3):
+        raise ValueError("Temporal-Lite Ridge profile requires canonical Mobility q0/q3.")
+    coefficient_shape = tuple(int(value) for value in prior.coefficients.shape)
+    if not np.iscomplexobj(prior.coefficients):
+        raise ValueError("Temporal-Lite Ridge coefficients must be complex-valued.")
+    complex_input_features = shape[1] * shape[2]
+    expected_output_features = (
+        len(prior.target_blocks) * GRID_HEIGHT * GRID_WIDTH
+    )
+    if coefficient_shape != (complex_input_features, expected_output_features):
+        raise ValueError(
+            "Temporal-Lite Ridge coefficient shape mismatch: "
+            f"expected {(complex_input_features, expected_output_features)}, "
+            f"got {coefficient_shape}."
+        )
+    complex_coefficients = int(np.prod(coefficient_shape))
+    parameter_real_equivalents = 2 * complex_coefficients
+    real_macs = (
+        shape[0]
+        * shape[3]
+        * complex_input_features
+        * coefficient_shape[1]
+        * 4
+    )
+    return {
+        "prior_coefficient_shape": list(coefficient_shape),
+        "prior_complex_parameters": complex_coefficients,
+        "prior_parameter_real_equivalents": parameter_real_equivalents,
+        "prior_real_macs": real_macs,
+        "prior_gmacs": real_macs / 1e9,
+        "prior_real_flops": 2 * real_macs,
+        "prior_gflops": 2 * real_macs / 1e9,
+        "prior_complex_mac_real_mac_equivalent": 4,
+        "parameter_convention": "1 complex Ridge coefficient = 2 real scalar equivalents",
+        "mac_convention": "1 complex multiply-accumulate = 4 real MACs",
+    }
+
+
 def profile_temporal_lite(
     output_root: str | Path,
     *,
     spatial_checkpoint: str | Path,
+    prior_path: str | Path,
+    validated_prior: Mapping[str, object],
     device: torch.device = torch.device("cpu"),
 ) -> dict[str, dict[str, object]]:
     if device.type != "cpu":
         raise ValueError("Temporal-Lite planning/profile must remain CPU-only.")
     root = Path(output_root).resolve()
+    prior_source = Path(prior_path).resolve()
+    if (
+        validated_prior.get("path") != str(prior_source)
+        or validated_prior.get("sha256") != file_sha256(prior_source)
+        or validated_prior.get("semantics_hash")
+        != DataSemantics.for_domain("mobility").stable_hash()
+        or validated_prior.get("test_split_used") is not False
+    ):
+        raise ValueError(
+            "Temporal-Lite profiling requires the exact provenance-validated Ridge artifact."
+        )
+    prior = RidgePrior.load(prior_source)
     profiles: dict[str, dict[str, object]] = {}
     for name, learned in (("T1-Lite", False), ("TL24", True)):
         model = build_tl24_model(learned=learned).to(device)
@@ -304,6 +388,13 @@ def profile_temporal_lite(
         )
         result.pop("latency_ms_batch1", None)
         result.pop("peak_gpu_memory_bytes", None)
+        ridge = profile_ridge_complexity(prior, result["input_shape"])
+        neural_parameters = int(result["parameters"])
+        neural_macs = int(result["macs"])
+        total_parameter_real_equivalents = (
+            neural_parameters + int(ridge["prior_parameter_real_equivalents"])
+        )
+        total_real_macs = neural_macs + int(ridge["prior_real_macs"])
         result.update(
             {
                 "candidate": name,
@@ -314,6 +405,19 @@ def profile_temporal_lite(
                 "temporal_rank": TL24.temporal_rank if learned else None,
                 "temporal_residual_enabled": False,
                 "target_scope": "mobility_q0_q5_end_to_end",
+                "complexity_scope": "raw_observations_through_ridge_to_q0_q5",
+                "neural_parameters": neural_parameters,
+                "neural_trainable_parameters": int(result["trainable_parameters"]),
+                "neural_macs": neural_macs,
+                "neural_gmacs": float(result["gmacs"]),
+                "neural_flops": int(result["flops"]),
+                "neural_gflops": float(result["gflops"]),
+                **ridge,
+                "total_parameter_real_equivalents": total_parameter_real_equivalents,
+                "total_real_macs": total_real_macs,
+                "total_gmacs": total_real_macs / 1e9,
+                "total_real_flops": 2 * total_real_macs,
+                "total_gflops": 2 * total_real_macs / 1e9,
                 "test_split_used": False,
             }
         )
@@ -321,9 +425,12 @@ def profile_temporal_lite(
             result["parameter_budget"] = LPAN_L_PARAMETERS
             result["gmac_budget"] = LPAN_L_GMACS
             result["parameter_budget_pass"] = (
-                int(result["parameters"]) < LPAN_L_PARAMETERS
+                int(result["total_parameter_real_equivalents"])
+                < LPAN_L_PARAMETERS
             )
-            result["gmac_budget_pass"] = float(result["gmacs"]) < LPAN_L_GMACS
+            result["gmac_budget_pass"] = (
+                float(result["total_gmacs"]) < LPAN_L_GMACS
+            )
             result["budget_pass"] = bool(
                 result["parameter_budget_pass"] and result["gmac_budget_pass"]
             )
@@ -446,7 +553,11 @@ def build_temporal_lite_plan(
     )
     profiles = (
         profile_temporal_lite(
-            root, spatial_checkpoint=spatial_checkpoint_path, device=torch.device("cpu")
+            root,
+            spatial_checkpoint=spatial_checkpoint_path,
+            prior_path=prior_path,
+            validated_prior=prior,
+            device=torch.device("cpu"),
         )
         if run_profiles
         else {}
@@ -544,6 +655,8 @@ def build_temporal_lite_plan(
     }
     tl_profile = profiles.get("TL24", {})
     budget_pass = tl_profile.get("budget_pass") if run_profiles else None
+    total_parameters = tl_profile.get("total_parameter_real_equivalents")
+    total_gmacs = tl_profile.get("total_gmacs")
     plan = {
         "schema": TEMPORAL_LITE_SCHEMA,
         "workflow": "PriST-RIS Temporal-Lite V1",
@@ -564,8 +677,22 @@ def build_temporal_lite_plan(
         "profiles": profiles,
         "complexity_budget": {
             "reference": "LPAN-L",
-            "parameters_less_than": LPAN_L_PARAMETERS,
-            "gmacs_less_than": LPAN_L_GMACS,
+            "total_parameter_real_equivalents_less_than": LPAN_L_PARAMETERS,
+            "total_gmacs_less_than": LPAN_L_GMACS,
+            "tl24_total_parameter_real_equivalents": tl_profile.get(
+                "total_parameter_real_equivalents"
+            ),
+            "tl24_total_gmacs": tl_profile.get("total_gmacs"),
+            "parameter_margin": (
+                LPAN_L_PARAMETERS - int(total_parameters)
+                if total_parameters is not None
+                else None
+            ),
+            "gmac_margin": (
+                LPAN_L_GMACS - float(total_gmacs)
+                if total_gmacs is not None
+                else None
+            ),
             "budget_pass": budget_pass,
         },
         "commands": commands,
@@ -717,6 +844,36 @@ def _decide_evaluation(
 Invoke = Callable[[list[object]], None]
 
 
+def _total_complexity_is_consistent(profile: Mapping[str, object]) -> bool:
+    try:
+        historical_parameters = int(profile["parameters"])
+        neural_parameters = int(profile["neural_parameters"])
+        prior_complex_parameters = int(profile["prior_complex_parameters"])
+        prior_parameters = int(profile["prior_parameter_real_equivalents"])
+        total_parameters = int(profile["total_parameter_real_equivalents"])
+        historical_macs = int(profile["macs"])
+        neural_macs = int(profile["neural_macs"])
+        prior_macs = int(profile["prior_real_macs"])
+        prior_gmacs = float(profile["prior_gmacs"])
+        total_macs = int(profile["total_real_macs"])
+        total_gmacs = float(profile["total_gmacs"])
+        total_flops = int(profile["total_real_flops"])
+        total_gflops = float(profile["total_gflops"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        historical_parameters == neural_parameters
+        and historical_macs == neural_macs
+        and prior_parameters == 2 * prior_complex_parameters
+        and abs(prior_gmacs - prior_macs / 1e9) < 1e-15
+        and total_parameters == neural_parameters + prior_parameters
+        and total_macs == neural_macs + prior_macs
+        and abs(total_gmacs - total_macs / 1e9) < 1e-15
+        and total_flops == 2 * total_macs
+        and abs(total_gflops - total_flops / 1e9) < 1e-15
+    )
+
+
 def execute_temporal_lite_plan(
     plan: Mapping[str, object],
     *,
@@ -740,8 +897,17 @@ def execute_temporal_lite_plan(
     tl_profile = profiles.get("TL24") if isinstance(profiles, Mapping) else None
     if (
         not isinstance(tl_profile, Mapping)
-        or int(tl_profile.get("parameters", LPAN_L_PARAMETERS)) >= LPAN_L_PARAMETERS
-        or float(tl_profile.get("gmacs", LPAN_L_GMACS)) >= LPAN_L_GMACS
+        or not _total_complexity_is_consistent(tl_profile)
+        or int(
+            tl_profile.get(
+                "total_parameter_real_equivalents", LPAN_L_PARAMETERS
+            )
+        )
+        >= LPAN_L_PARAMETERS
+        or float(tl_profile.get("total_gmacs", LPAN_L_GMACS)) >= LPAN_L_GMACS
+        or tl_profile.get("parameter_budget_pass") is not True
+        or tl_profile.get("gmac_budget_pass") is not True
+        or tl_profile.get("budget_pass") is not True
         or tl_profile.get("target_scope") != "mobility_q0_q5_end_to_end"
         or tl_profile.get("test_split_used") is not False
     ):
@@ -893,6 +1059,24 @@ def summarize_temporal_lite(
                 "trainable_parameters": profile.get("trainable_parameters"),
                 "gmacs": profile.get("gmacs"),
                 "gflops": profile.get("gflops"),
+                "neural_parameters": profile.get("neural_parameters"),
+                "neural_macs": profile.get("neural_macs"),
+                "neural_gmacs": profile.get("neural_gmacs"),
+                "prior_complex_parameters": profile.get(
+                    "prior_complex_parameters"
+                ),
+                "prior_parameter_real_equivalents": profile.get(
+                    "prior_parameter_real_equivalents"
+                ),
+                "prior_real_macs": profile.get("prior_real_macs"),
+                "prior_gmacs": profile.get("prior_gmacs"),
+                "total_parameter_real_equivalents": profile.get(
+                    "total_parameter_real_equivalents"
+                ),
+                "total_real_macs": profile.get("total_real_macs"),
+                "total_gmacs": profile.get("total_gmacs"),
+                "total_real_flops": profile.get("total_real_flops"),
+                "total_gflops": profile.get("total_gflops"),
                 "performance_gap_db": _gaps(
                     diagnostics["overall_validation_nmse_db"]
                 ),
@@ -933,6 +1117,24 @@ def summarize_temporal_lite(
                 "trainable_parameters": profile.get("trainable_parameters"),
                 "gmacs": profile.get("gmacs"),
                 "gflops": profile.get("gflops"),
+                "neural_parameters": profile.get("neural_parameters"),
+                "neural_macs": profile.get("neural_macs"),
+                "neural_gmacs": profile.get("neural_gmacs"),
+                "prior_complex_parameters": profile.get(
+                    "prior_complex_parameters"
+                ),
+                "prior_parameter_real_equivalents": profile.get(
+                    "prior_parameter_real_equivalents"
+                ),
+                "prior_real_macs": profile.get("prior_real_macs"),
+                "prior_gmacs": profile.get("prior_gmacs"),
+                "total_parameter_real_equivalents": profile.get(
+                    "total_parameter_real_equivalents"
+                ),
+                "total_real_macs": profile.get("total_real_macs"),
+                "total_gmacs": profile.get("total_gmacs"),
+                "total_real_flops": profile.get("total_real_flops"),
+                "total_gflops": profile.get("total_gflops"),
                 "budget_pass": profile.get("budget_pass"),
                 "performance_gap_db": _gaps(
                     diagnostics["overall_validation_nmse_db"]
@@ -949,6 +1151,7 @@ def summarize_temporal_lite(
         "missing_candidates": missing,
         "complexity_budget": plan.get("complexity_budget"),
         "reference_nmse_db": dict(REFERENCE_NMSE_DB),
+        "reference_metadata": dict(REFERENCE_METADATA),
         "winner": None,
         "human_decision_only": True,
         "test_split_used": False,

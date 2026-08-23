@@ -574,6 +574,8 @@ def complex_factorized_reconstruction(
 
 
 class TrendConditionedTemporal(nn.Module):
+    """Bounded trend-coefficient correction plus complex low-rank residual."""
+
     def __init__(self, hidden: int, rank: int, *, use_delta: bool = True) -> None:
         super().__init__()
         if rank not in {2, 3}:

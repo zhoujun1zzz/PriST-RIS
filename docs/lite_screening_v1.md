@@ -2,8 +2,9 @@
 
 ## Scope
 
-This workflow asks only how far the Prior-S3 spatial residual backbone can be
-compressed. It does not replace the frozen PriST-RIS model, change S3 or the
+This workflow asks only how far a prior-guided spatial residual backbone that
+retains the S3-selected RIS-coordinate and SE mechanisms can be compressed. It
+does not replace the frozen PriST-RIS model, change S3 or the
 paper matrix, search additional candidates, or implement Temporal-Lite.
 
 The only candidates are:
@@ -13,7 +14,8 @@ The only candidates are:
 | Lite-A | 32 | 2,2,1 | 1 |
 | Lite-B | 40 | 2,2,1 | 1 |
 
-Both use Mobility q0/q3, Prior-S3, direct-add RIS coordinates, no antenna index,
+Both use Mobility q0/q3, a fraction-matched Ridge prior, direct-add RIS
+coordinates, no antenna index,
 no attention, no multiscale supervision, SE channel attention, and scaled true
 residual blocks. Optimization is fixed to AdamW, LR `5e-4`, weight decay
 `1e-5`, cosine to `5e-6`, 100 epochs, `min_epochs=101`, patience 15, batch
