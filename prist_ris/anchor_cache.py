@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import h5py
 import numpy as np
@@ -23,6 +25,13 @@ from .prior import RidgePrior, file_sha256
 
 
 ANCHOR_CACHE_SCHEMA = "prist_ris.spatial_anchor_cache.v1"
+
+
+def _indices_hash(indices: list[int]) -> str:
+    payload = json.dumps(
+        indices, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def read_anchor_cache_metadata(path: str | Path) -> dict[str, object]:
@@ -47,11 +56,17 @@ def write_spatial_anchor_cache(
     split: str,
     checkpoint_path: str | Path,
     prior_path: str | Path,
+    sample_provenance: Mapping[str, object] | None = None,
+    expected_sample_count: int | None = None,
 ) -> dict[str, object]:
     if split not in {"train", "validation"}:
         raise PermissionError("Spatial anchor cache is restricted to TRAIN/VALIDATION.")
     if model.config.domain != "mobility" or tuple(model.output_time_index) != (0, 3):
         raise ValueError("Anchor cache source must be a Mobility q0/q3 spatial model.")
+    if sample_provenance is not None and sample_provenance.get(
+        "test_split_used"
+    ) is not False:
+        raise PermissionError("Anchor cache sample provenance must exclude TEST.")
     destination = Path(path)
     if destination.exists():
         raise FileExistsError(f"Anchor cache already exists: {destination}")
@@ -70,11 +85,17 @@ def write_spatial_anchor_cache(
         "temporal_protocol_version": TEMPORAL_PROTOCOL_VERSION,
         "spatial_multiscale_supervision": model.config.spatial_multiscale_supervision,
         "spatial_channel_attention": model.config.spatial_channel_attention,
+        "spatial_model_config": asdict(model.config),
+        "sample_provenance": (
+            dict(sample_provenance) if sample_provenance is not None else None
+        ),
+        "expected_sample_count": expected_sample_count,
         "output_time_index": [0, 3],
         "target_cached": False,
         "test_split_used": False,
     }
     count = 0
+    written_indices: list[int] = []
     model.eval()
     with h5py.File(destination, "x") as handle:
         anchors_ds = handle.create_dataset(
@@ -99,8 +120,14 @@ def write_spatial_anchor_cache(
             indices_ds.resize(next_count, axis=0)
             anchors_ds[count:next_count] = anchors
             indices_ds[count:next_count] = indices
+            written_indices.extend(int(value) for value in indices.tolist())
             count = next_count
         metadata["sample_count"] = count
+        metadata["sample_indices_hash"] = _indices_hash(written_indices)
+        if expected_sample_count is not None and count != expected_sample_count:
+            raise ValueError(
+                f"Anchor cache {split} count {count} != expected {expected_sample_count}."
+            )
         handle.attrs["metadata_json"] = json.dumps(metadata, sort_keys=True)
     return {**metadata, "path": str(destination.resolve())}
 
@@ -133,6 +160,9 @@ class SpatialAnchorCacheDataset(Dataset[dict[str, torch.Tensor]]):
             or self.metadata.get("checkpoint_sha256") != file_sha256(expected_checkpoint)
             or self.metadata.get("prior_sha256") != file_sha256(expected_prior)
             or self.metadata.get("target_cached") is not False
+            # Legacy TRAIN/VALIDATION caches predate this explicit field; the
+            # Temporal-Lite gate separately requires it to be present and false.
+            or self.metadata.get("test_split_used", False) is not False
         ):
             raise ValueError("Anchor cache checkpoint/prior/protocol/hash mismatch.")
         with h5py.File(self.cache_path, "r") as handle:

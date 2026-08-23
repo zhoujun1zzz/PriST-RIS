@@ -51,6 +51,7 @@ class TrainingConfig:
     mode: str = "dev"
     seed: int = 123
     hidden: int = 80
+    temporal_hidden: int | None = None
     blocks_per_stage: tuple[int, int, int] = (3, 3, 4)
     final_refine_blocks: int = 4
     temporal_rank: int = 2
@@ -460,6 +461,7 @@ def train(
         config.model_key,
         domain=config.domain,
         hidden=config.hidden,
+        temporal_hidden=config.temporal_hidden,
         blocks_per_stage=config.blocks_per_stage,
         final_refine_blocks=config.final_refine_blocks,
         temporal_rank=config.temporal_rank,
@@ -541,6 +543,7 @@ def train(
             # runs. Preserve their default resume compatibility.
             stored_compare.setdefault("scheduler", "fixed")
             stored_compare.setdefault("min_learning_rate", 5e-6)
+            stored_compare.setdefault("temporal_hidden", None)
             stored_compare.setdefault("test_split_used", False)
             stored_epochs = int(stored_compare.pop("epochs"))
             current_epochs = int(current_compare.pop("epochs"))
@@ -593,6 +596,9 @@ def train(
             "spatial_supervision_protocol_version",
             "temporal_base_mode",
             "temporal_learned_residual_enabled",
+            "temporal_hidden",
+            "temporal_hidden_explicit",
+            "temporal_residual_enabled",
             "temporal_protocol_version",
         )
     }

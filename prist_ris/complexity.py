@@ -110,9 +110,16 @@ def profile_model(
         "prior_anchors": model.anchor_count if model.uses_prior else 0,
         "spatial_anchor_time_index": list(model.spatial_anchor_time_index),
         "output_time_index": list(model.output_time_index),
+        "spatial_hidden": model.config.hidden,
+        "temporal_hidden": (
+            model.config.effective_temporal_hidden
+            if model.temporal is not None
+            else None
+        ),
         "temporal_rank": model.config.temporal_rank if model.temporal is not None else None,
         "temporal_base_mode": model.config.temporal_base_mode,
         "temporal_learned_residual_enabled": model.config.temporal_learned_residual_enabled,
+        "temporal_residual_enabled": model.temporal_correction is not None,
         "parameters": parameters,
         "trainable_parameters": trainable,
         "macs": macs,
