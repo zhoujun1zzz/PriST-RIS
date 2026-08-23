@@ -70,6 +70,12 @@ from .paper_matrix import (
     execute_paper_matrix,
     summarize_paper_matrix,
 )
+from .lite_screening import (
+    LITE_SEED,
+    build_lite_plan,
+    execute_lite_plan,
+    summarize_lite_plan,
+)
 from .screening import (
     SPATIAL_MODULE_CANDIDATES,
     SPATIAL_MODULE_REFERENCE_DB,
@@ -1414,6 +1420,45 @@ def paper_matrix_command(args: argparse.Namespace) -> dict[str, object]:
     return result
 
 
+def lite_screen_command(args: argparse.Namespace) -> dict[str, object]:
+    root = Path(args.output_root).resolve()
+    plan_path = root / "lite_screen_plan.json"
+    if args.action == "summarize":
+        if not plan_path.is_file():
+            raise FileNotFoundError(f"Lite summary requires {plan_path}.")
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        result = summarize_lite_plan(root, plan)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    if args.prior is None or args.sample_index_manifest is None:
+        raise ValueError("Lite plan/run requires --prior and --sample-index-manifest.")
+    plan = build_lite_plan(
+        root,
+        prior_path=args.prior,
+        sample_manifest_path=args.sample_index_manifest,
+        data_root=args.data_root,
+        workers=args.workers,
+        seed=args.seed,
+        project_root=PROJECT,
+        run_profiles=True,
+    )
+    if args.action == "plan":
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+        return plan
+    execution = execute_lite_plan(
+        plan,
+        data_root=args.data_root,
+        device=args.device,
+        workers=args.workers,
+        physical_gpu_index=args.physical_gpu_index,
+        confirm_gpu_free=args.confirm_gpu_free,
+        resume_incomplete=args.resume_incomplete,
+        invoke=lambda values: _invoke(values, dry_run=False),
+    )
+    print(json.dumps(execution, indent=2, ensure_ascii=False))
+    return execution
+
+
 def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     allow_test = _allowed_test(args)
     device = torch.device(args.device)
@@ -1807,6 +1852,22 @@ def parser() -> argparse.ArgumentParser:
         "--output-root", type=Path, default=Path("runs/paper_matrix")
     )
     paper_matrix.set_defaults(func=paper_matrix_command)
+
+    lite_screen = commands.add_parser("lite-screen")
+    add_runtime_arguments(lite_screen)
+    lite_screen.add_argument(
+        "--action", choices=("plan", "run", "summarize"), required=True
+    )
+    lite_screen.add_argument("--prior", type=Path)
+    lite_screen.add_argument("--sample-index-manifest", type=Path)
+    lite_screen.add_argument("--seed", type=int, default=LITE_SEED)
+    lite_screen.add_argument("--physical-gpu-index", type=int, default=0)
+    lite_screen.add_argument("--confirm-gpu-free", action="store_true")
+    lite_screen.add_argument("--resume-incomplete", action="store_true")
+    lite_screen.add_argument(
+        "--output-root", type=Path, default=Path("runs/lite_screening_v1")
+    )
+    lite_screen.set_defaults(func=lite_screen_command)
 
     evaluation = commands.add_parser("evaluate")
     add_runtime_arguments(evaluation)
