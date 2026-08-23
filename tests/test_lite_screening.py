@@ -133,6 +133,8 @@ def test_plan_is_cpu_only_exact_two_candidates_and_no_test(tmp_path: Path) -> No
         assert "--target-blocks 0,3" in joined
         assert "--amp" not in command
         assert "--split" not in command and "--include-test" not in command
+    for spec in plan["experiments"]:
+        assert Path(spec["run_dir"]).name == spec["run_name"]
     assert plan["scope_caveat"] == SPATIAL_SCOPE_CAVEAT
     assert plan["temporal_lite_implemented"] is False
 

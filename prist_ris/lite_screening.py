@@ -258,11 +258,12 @@ def experiment_spec(
     prior: Mapping[str, object],
 ) -> dict[str, object]:
     slug = candidate.candidate.lower().replace("-", "_")
+    run_name = f"prist_ris_{slug}_seed123_fraction_0.25"
     return {
         "schema": LITE_SCREENING_SCHEMA,
         "candidate": candidate.candidate,
-        "run_name": f"prist_ris_{slug}_seed123_fraction_0.25",
-        "run_dir": str((root / "runs" / slug).resolve()),
+        "run_name": run_name,
+        "run_dir": str((root / "runs" / run_name).resolve()),
         "git_head": head,
         "canonical_mobility_semantics_hash": DataSemantics.for_domain(
             "mobility"
