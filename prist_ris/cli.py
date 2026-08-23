@@ -38,6 +38,7 @@ from .data import (
 from .engine import (
     TrainingConfig,
     evaluate,
+    load_mobility_spatial_reference,
     require_checkpoint_contract,
     seed_everything,
     train,
@@ -75,6 +76,13 @@ from .lite_screening import (
     build_lite_plan,
     execute_lite_plan,
     summarize_lite_plan,
+)
+from .temporal_lite import (
+    TEMPORAL_LITE_SEED,
+    build_temporal_lite_plan,
+    execute_temporal_lite_plan,
+    summarize_temporal_lite,
+    validate_full_sample_manifest,
 )
 from .screening import (
     SPATIAL_MODULE_CANDIDATES,
@@ -165,6 +173,7 @@ def profile_command(args: argparse.Namespace) -> dict[str, object]:
         args.model,
         domain=args.domain,
         hidden=args.hidden,
+        temporal_hidden=args.temporal_hidden,
         blocks_per_stage=args.blocks_per_stage,
         final_refine_blocks=args.final_refine_blocks,
         temporal_rank=args.temporal_rank,
@@ -238,6 +247,24 @@ def cache_spatial_anchors_command(args: argparse.Namespace) -> dict[str, object]
         raise ValueError("Checkpoint and anchor-cache Ridge SHA256 mismatch.")
     model = build_model(**model_config).to(device)
     model.load_state_dict(state["model_state"])
+    sample_provenance = (
+        validate_full_sample_manifest(args.sample_index_manifest, seed=args.seed)
+        if args.sample_index_manifest is not None
+        else None
+    )
+    train_indices = None
+    if args.sample_index_manifest is not None:
+        sample_payload = json.loads(
+            args.sample_index_manifest.read_text(encoding="utf-8")
+        )
+        train_indices = [int(value) for value in sample_payload["fractions"]["1.00"]]
+    experiment_spec = None
+    if args.experiment_spec is not None:
+        experiment_spec = json.loads(args.experiment_spec.read_text(encoding="utf-8"))
+        if not isinstance(experiment_spec, dict) or experiment_spec.get(
+            "test_split_used"
+        ) is not False:
+            raise PermissionError("Anchor-cache experiment spec must exclude TEST.")
     outputs = []
     for split, maximum in (
         ("train", args.max_train),
@@ -250,7 +277,10 @@ def cache_spatial_anchors_command(args: argparse.Namespace) -> dict[str, object]
             batch_size=args.batch_size,
             workers=args.workers,
             seed=args.seed,
-            max_samples=maximum,
+            max_samples=(
+                maximum if split == "validation" or train_indices is None else None
+            ),
+            indices=(train_indices if split == "train" else None),
             shuffle=False,
         )
         outputs.append(
@@ -263,12 +293,15 @@ def cache_spatial_anchors_command(args: argparse.Namespace) -> dict[str, object]
                 split=split,
                 checkpoint_path=args.checkpoint,
                 prior_path=args.prior,
+                sample_provenance=sample_provenance,
+                expected_sample_count=maximum,
             )
         )
     result = {
         "method": "PriST-RIS",
         "workflow": "cache_spatial_anchors",
         "caches": outputs,
+        "experiment_spec": experiment_spec,
         "test_split_used": False,
     }
     _json(Path(args.output_root) / "cache_manifest.json", result)
@@ -277,6 +310,14 @@ def cache_spatial_anchors_command(args: argparse.Namespace) -> dict[str, object]
 
 
 def evaluate_temporal_cache_command(args: argparse.Namespace) -> dict[str, object]:
+    device = torch.device(args.device)
+    state = load_checkpoint(args.spatial_checkpoint, device)
+    require_checkpoint_contract(
+        state, "Temporal cache evaluation", expected_domain="mobility"
+    )
+    spatial_config = dict(state["model_config"])
+    if spatial_config.get("model_key") == "prist_ris_full":
+        raise ValueError("Temporal cache evaluation requires a q0/q3 checkpoint.")
     loader = make_anchor_cache_loader(
         Path(args.anchor_cache_root) / "validation.h5",
         resolve_dataset_source(args.data_root, "mobility", "validation"),
@@ -288,26 +329,37 @@ def evaluate_temporal_cache_command(args: argparse.Namespace) -> dict[str, objec
         shuffle=False,
     )
     model = build_model(
-        "prist_ris_full",
-        domain="mobility",
-        hidden=80,
-        blocks_per_stage=(3, 3, 2),
-        final_refine_blocks=1,
-        backbone_ris_coordinate_enabled=True,
-        backbone_antenna_index_enabled=False,
-        backbone_ris_coordinate_mode="direct_add",
-        attention_enabled=False,
-        attention_ris_coordinate_enabled=False,
-        attention_antenna_index_enabled=False,
-        temporal_base_mode="linear_trend",
-        temporal_learned_residual_enabled=False,
-        temporal_residual=False,
-    ).to(torch.device(args.device))
-    result = evaluate(model, loader, torch.device(args.device), prior=None, target_blocks=None)
+        **{
+            **spatial_config,
+            "model_key": "prist_ris_full",
+            "temporal_hidden": None,
+            "temporal_rank": 2,
+            "temporal_residual": False,
+            "temporal_mode": "trend",
+            "temporal_base_mode": "linear_trend",
+            "temporal_learned_residual_enabled": False,
+        },
+    ).to(device)
+    load_mobility_spatial_reference(model, state)
+    started = time.perf_counter()
+    result = evaluate(model, loader, device, prior=None, target_blocks=None)
+    experiment_spec = None
+    if args.experiment_spec is not None:
+        experiment_spec = json.loads(args.experiment_spec.read_text(encoding="utf-8"))
+        if not isinstance(experiment_spec, dict) or experiment_spec.get(
+            "test_split_used"
+        ) is not False:
+            raise PermissionError("T1-Lite experiment spec must exclude TEST.")
     payload = {
         "method": "PriST-RIS",
         "candidate": "T1_linear_trend",
         "temporal_protocol_version": TEMPORAL_PROTOCOL_VERSION,
+        "spatial_model_config": spatial_config,
+        "spatial_checkpoint": str(Path(args.spatial_checkpoint).resolve()),
+        "spatial_checkpoint_sha256": file_sha256(args.spatial_checkpoint),
+        "prior_sha256": file_sha256(args.prior),
+        "wall_clock_seconds": time.perf_counter() - started,
+        "experiment_spec": experiment_spec,
         **result,
         "test_split_used": False,
     }
@@ -1061,6 +1113,7 @@ def train_command(args: argparse.Namespace) -> dict[str, object]:
         mode=args.mode,
         seed=args.seed,
         hidden=args.hidden,
+        temporal_hidden=args.temporal_hidden,
         blocks_per_stage=args.blocks_per_stage,
         final_refine_blocks=args.final_refine_blocks,
         temporal_rank=args.temporal_rank,
@@ -1459,6 +1512,52 @@ def lite_screen_command(args: argparse.Namespace) -> dict[str, object]:
     return execution
 
 
+def temporal_lite_command(args: argparse.Namespace) -> dict[str, object]:
+    root = Path(args.output_root).resolve()
+    plan_path = root / "temporal_lite_plan.json"
+    if args.action == "summarize":
+        if not plan_path.is_file():
+            raise FileNotFoundError(f"Temporal-Lite summary requires {plan_path}.")
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        result = summarize_temporal_lite(root, plan)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    if any(
+        value is None
+        for value in (args.spatial_checkpoint, args.prior, args.sample_index_manifest)
+    ):
+        raise ValueError(
+            "Temporal-Lite plan/run requires --spatial-checkpoint, --prior, "
+            "and --sample-index-manifest."
+        )
+    plan = build_temporal_lite_plan(
+        root,
+        spatial_checkpoint_path=args.spatial_checkpoint,
+        prior_path=args.prior,
+        sample_manifest_path=args.sample_index_manifest,
+        data_root=args.data_root,
+        workers=args.workers,
+        seed=args.seed,
+        project_root=PROJECT,
+        run_profiles=True,
+    )
+    if args.action == "plan":
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+        return plan
+    execution = execute_temporal_lite_plan(
+        plan,
+        data_root=args.data_root,
+        device=args.device,
+        workers=args.workers,
+        physical_gpu_index=args.physical_gpu_index,
+        confirm_gpu_free=args.confirm_gpu_free,
+        resume_incomplete=args.resume_incomplete,
+        invoke=lambda values: _invoke(values, dry_run=False),
+    )
+    print(json.dumps(execution, indent=2, ensure_ascii=False))
+    return execution
+
+
 def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
     allow_test = _allowed_test(args)
     device = torch.device(args.device)
@@ -1495,12 +1594,22 @@ def evaluate_command(args: argparse.Namespace) -> dict[str, object]:
         prior=prior,
         target_blocks=tuple(config["target_blocks"]) if config.get("target_blocks") else None,
     )
+    experiment_spec = None
+    if args.experiment_spec is not None:
+        experiment_spec = json.loads(args.experiment_spec.read_text(encoding="utf-8"))
+        if not isinstance(experiment_spec, dict) or experiment_spec.get(
+            "test_split_used"
+        ) is not False:
+            raise PermissionError("Evaluation experiment spec must exclude TEST.")
     payload = {
         "method": "PriST-RIS",
         "architecture_version": ARCHITECTURE_VERSION,
         "split": args.split,
         "checkpoint": str(Path(args.checkpoint).resolve()),
+        "checkpoint_sha256": file_sha256(args.checkpoint),
         "freeze_manifest": str(Path(args.freeze_manifest).resolve()) if args.freeze_manifest else None,
+        "experiment_spec": experiment_spec,
+        "test_split_used": args.split == "test",
         **result,
     }
     _json(args.output, payload)
@@ -1563,6 +1672,7 @@ def add_model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model", choices=ALL_MODEL_KEYS, default="prist_ris_full")
     parser.add_argument("--domain", choices=("quasi", "mobility"), required=True)
     parser.add_argument("--hidden", type=int, default=80)
+    parser.add_argument("--temporal-hidden", type=int, default=None)
     parser.add_argument("--blocks-per-stage", type=csv_ints, default=(3, 3, 4))
     parser.add_argument("--final-refine-blocks", type=int, default=4)
     parser.add_argument("--temporal-rank", type=int, choices=(2, 3), default=2)
@@ -1686,6 +1796,8 @@ def parser() -> argparse.ArgumentParser:
     anchor_cache.add_argument("--checkpoint", type=Path, required=True)
     anchor_cache.add_argument("--prior", type=Path, required=True)
     anchor_cache.add_argument("--seed", type=int, default=123)
+    anchor_cache.add_argument("--sample-index-manifest", type=Path)
+    anchor_cache.add_argument("--experiment-spec", type=Path)
     anchor_cache.add_argument("--batch-size", type=int, default=16)
     anchor_cache.add_argument("--max-train", type=int)
     anchor_cache.add_argument("--max-validation", type=int)
@@ -1698,6 +1810,7 @@ def parser() -> argparse.ArgumentParser:
     temporal_cache_eval.add_argument("--spatial-checkpoint", type=Path, required=True)
     temporal_cache_eval.add_argument("--anchor-cache-root", type=Path, required=True)
     temporal_cache_eval.add_argument("--seed", type=int, default=123)
+    temporal_cache_eval.add_argument("--experiment-spec", type=Path)
     temporal_cache_eval.add_argument("--batch-size", type=int, default=32)
     temporal_cache_eval.add_argument("--output", type=Path, required=True)
     temporal_cache_eval.set_defaults(func=evaluate_temporal_cache_command)
@@ -1869,12 +1982,30 @@ def parser() -> argparse.ArgumentParser:
     )
     lite_screen.set_defaults(func=lite_screen_command)
 
+    temporal_lite = commands.add_parser("temporal-lite")
+    add_runtime_arguments(temporal_lite)
+    temporal_lite.add_argument(
+        "--action", choices=("plan", "run", "summarize"), required=True
+    )
+    temporal_lite.add_argument("--spatial-checkpoint", type=Path)
+    temporal_lite.add_argument("--prior", type=Path)
+    temporal_lite.add_argument("--sample-index-manifest", type=Path)
+    temporal_lite.add_argument("--seed", type=int, default=TEMPORAL_LITE_SEED)
+    temporal_lite.add_argument("--physical-gpu-index", type=int, default=0)
+    temporal_lite.add_argument("--confirm-gpu-free", action="store_true")
+    temporal_lite.add_argument("--resume-incomplete", action="store_true")
+    temporal_lite.add_argument(
+        "--output-root", type=Path, default=Path("runs/temporal_lite_v1")
+    )
+    temporal_lite.set_defaults(func=temporal_lite_command, workers=8)
+
     evaluation = commands.add_parser("evaluate")
     add_runtime_arguments(evaluation)
     evaluation.add_argument("--checkpoint", type=Path, required=True)
     evaluation.add_argument("--prior", type=Path, help="Optional relocated copy of the checkpoint's exact Ridge artifact.")
     evaluation.add_argument("--split", choices=("validation", "test"), default="validation")
     evaluation.add_argument("--freeze-manifest", type=Path)
+    evaluation.add_argument("--experiment-spec", type=Path)
     evaluation.add_argument("--batch-size", type=int, default=64)
     evaluation.add_argument("--output", type=Path, required=True)
     evaluation.set_defaults(func=evaluate_command)

@@ -717,6 +717,7 @@ class PriSTRISConfig:
     model_key: str
     domain: str
     hidden: int = 80
+    temporal_hidden: int | None = None
     blocks_per_stage: tuple[int, int, int] = (3, 3, 4)
     final_refine_blocks: int = 4
     temporal_rank: int = 2
@@ -743,6 +744,10 @@ class PriSTRISConfig:
     spatial_supervision_protocol_version: str = SPATIAL_SUPERVISION_PROTOCOL_VERSION
     temporal_protocol_version: str = TEMPORAL_PROTOCOL_VERSION
 
+    @property
+    def effective_temporal_hidden(self) -> int:
+        return self.hidden if self.temporal_hidden is None else self.temporal_hidden
+
 
 class PriSTRIS(nn.Module):
     """Canonical PriST-RIS V3.2 stable prior-guided physical-grid model."""
@@ -766,6 +771,8 @@ class PriSTRIS(nn.Module):
             raise ValueError(
                 f"spatial_channel_attention must be one of {SPATIAL_CHANNEL_ATTENTION_MODES}."
             )
+        if config.hidden <= 0 or config.effective_temporal_hidden <= 0:
+            raise ValueError("Spatial and temporal hidden widths must be positive.")
         explicit_position = (
             config.backbone_ris_coordinate_enabled,
             config.backbone_antenna_index_enabled,
@@ -922,7 +929,7 @@ class PriSTRIS(nn.Module):
         )
         self.temporal = (
             TrendConditionedTemporal(
-                config.hidden,
+                config.effective_temporal_hidden,
                 config.temporal_rank,
                 use_delta=config.temporal_mode != "no_delta",
             )
@@ -1147,6 +1154,13 @@ class PriSTRIS(nn.Module):
                 and self.config.temporal_base_mode == "linear_trend"
             ),
             "temporal_rank": self.config.temporal_rank if self.temporal is not None else None,
+            "temporal_hidden": (
+                self.config.effective_temporal_hidden
+                if self.temporal is not None
+                else None
+            ),
+            "temporal_hidden_explicit": self.config.temporal_hidden,
+            "temporal_residual_enabled": self.temporal_correction is not None,
             "temporal_prediction_scope": (
                 "non_pilot_q1_q2_q4_q5" if self.temporal is not None else None
             ),
@@ -1160,6 +1174,7 @@ def build_model(
     *,
     domain: str,
     hidden: int = 80,
+    temporal_hidden: int | None = None,
     blocks_per_stage: tuple[int, int, int] = (3, 3, 4),
     final_refine_blocks: int = 4,
     temporal_rank: int = 2,
@@ -1189,6 +1204,7 @@ def build_model(
             model_key=canonical_model_key(model_key),
             domain=domain,
             hidden=hidden,
+            temporal_hidden=temporal_hidden,
             blocks_per_stage=blocks_per_stage,
             final_refine_blocks=final_refine_blocks,
             temporal_rank=temporal_rank,
