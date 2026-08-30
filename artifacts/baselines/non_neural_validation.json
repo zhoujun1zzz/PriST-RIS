@@ -1,0 +1,179 @@
+{
+  "status": "validation_only",
+  "domain": "mobility",
+  "split": "validation",
+  "sample_count": 1800,
+  "test_split_used": false,
+  "methods": {
+    "LS + Interpolation": {
+      "spatial": "row-wise linear interpolation with nearest extension",
+      "temporal": "linear q0-q3 interpolation with nearest extension after q3",
+      "metrics": {
+        "per_query": {
+          "q0": {
+            "sample_count": 1800,
+            "nmse_linear": 1.9984174611171086,
+            "nmse_db": 3.0068621568262173
+          },
+          "q1": {
+            "sample_count": 1800,
+            "nmse_linear": 1.9453936239745881,
+            "nmse_db": 2.8900748814212047
+          },
+          "q2": {
+            "sample_count": 1800,
+            "nmse_linear": 1.9462105626530117,
+            "nmse_db": 2.8918982527009636
+          },
+          "q3": {
+            "sample_count": 1800,
+            "nmse_linear": 2.0003306385543613,
+            "nmse_db": 3.011017869797323
+          },
+          "q4": {
+            "sample_count": 1800,
+            "nmse_linear": 2.0295539084408016,
+            "nmse_db": 3.0740059141454203
+          },
+          "q5": {
+            "sample_count": 1800,
+            "nmse_linear": 2.0582873376872803,
+            "nmse_db": 3.135060023318153
+          }
+        },
+        "overall": {
+          "sample_count": 1800,
+          "nmse_linear": 1.9963655931419797,
+          "nmse_db": 3.002400763026081
+        },
+        "pilot_anchor_aggregate": {
+          "sample_count": 1800,
+          "nmse_linear": 1.9993740515576468,
+          "nmse_db": 3.008940514121132
+        },
+        "observed_anchor_aggregate": {
+          "sample_count": 1800,
+          "nmse_linear": 1.9993740515576468,
+          "nmse_db": 3.008940514121132
+        },
+        "non_pilot_aggregate": {
+          "sample_count": 1800,
+          "nmse_linear": 1.9948613585366144,
+          "nmse_db": 2.999127179100945
+        },
+        "interpolation_q1_q2": {
+          "sample_count": 1800,
+          "nmse_linear": 1.9458020932144588,
+          "nmse_db": 2.8909866625314224
+        },
+        "extrapolation_q4_q5": {
+          "sample_count": 1800,
+          "nmse_linear": 2.0439206261105007,
+          "nmse_db": 3.1046402633960946
+        },
+        "delta_error": {
+          "sample_count": 1800,
+          "nmse_linear": 1.16369017554654,
+          "nmse_db": 0.6583736780434886
+        },
+        "curvature_error": {
+          "sample_count": 1800,
+          "nmse_linear": 1.1980750881301032,
+          "nmse_db": 0.7848403786850828
+        }
+      },
+      "seconds": 27.27769684791565
+    },
+    "Ridge-Linear": {
+      "prior_path": "artifacts/baselines/ridge_q0q3_full_train.npz",
+      "regularization": 0.001,
+      "fit_rows": 1280000,
+      "target_blocks": [
+        0,
+        3
+      ],
+      "temporal": "A0 + (t/3)*(A3-A0)",
+      "metrics": {
+        "per_query": {
+          "q0": {
+            "sample_count": 1800,
+            "nmse_linear": 0.02117034517422629,
+            "nmse_db": -16.742720609206128
+          },
+          "q1": {
+            "sample_count": 1800,
+            "nmse_linear": 0.037992876732928886,
+            "nmse_db": -14.202978214245688
+          },
+          "q2": {
+            "sample_count": 1800,
+            "nmse_linear": 0.03670577331497851,
+            "nmse_db": -14.352656218066661
+          },
+          "q3": {
+            "sample_count": 1800,
+            "nmse_linear": 0.02118478329386562,
+            "nmse_db": -16.739759741817416
+          },
+          "q4": {
+            "sample_count": 1800,
+            "nmse_linear": 0.1107341462534128,
+            "nmse_db": -9.557184383555615
+          },
+          "q5": {
+            "sample_count": 1800,
+            "nmse_linear": 0.4627218756576379,
+            "nmse_db": -3.3467996829170845
+          }
+        },
+        "overall": {
+          "sample_count": 1800,
+          "nmse_linear": 0.11508496687230137,
+          "nmse_db": -9.389814029627676
+        },
+        "pilot_anchor_aggregate": {
+          "sample_count": 1800,
+          "nmse_linear": 0.021177564192718514,
+          "nmse_db": -16.741239931659976
+        },
+        "observed_anchor_aggregate": {
+          "sample_count": 1800,
+          "nmse_linear": 0.021177564192718514,
+          "nmse_db": -16.741239931659976
+        },
+        "non_pilot_aggregate": {
+          "sample_count": 1800,
+          "nmse_linear": 0.16203866795947156,
+          "nmse_db": -7.9038133559600885
+        },
+        "interpolation_q1_q2": {
+          "sample_count": 1800,
+          "nmse_linear": 0.03734932506767412,
+          "nmse_db": -14.27717241828053
+        },
+        "extrapolation_q4_q5": {
+          "sample_count": 1800,
+          "nmse_linear": 0.2867280102148652,
+          "nmse_db": -5.425298791234323
+        },
+        "delta_error": {
+          "sample_count": 1800,
+          "nmse_linear": 0.7647990811864535,
+          "nmse_db": -1.164526424839083
+        },
+        "curvature_error": {
+          "sample_count": 1800,
+          "nmse_linear": 0.9999999971191088,
+          "nmse_db": -1.2511551495685579e-08
+        },
+        "regularization": 0.001,
+        "ridge_target_blocks": [
+          0,
+          3
+        ],
+        "temporal_rule": "A0 + (t/3) * (A3-A0)"
+      },
+      "seconds": 24.03194570541382
+    }
+  }
+}

@@ -1,0 +1,193 @@
+{
+  "status": "validation_prior_fit",
+  "method": "PriST-RIS Ridge spatial anchor",
+  "architecture_version": "3.2",
+  "mobility_contract_version": "mobility_q0_q3_v1",
+  "domain": "mobility",
+  "fit_split": "train",
+  "selection_split": "validation",
+  "test_split_used": false,
+  "target_blocks": [
+    0,
+    3
+  ],
+  "candidates": [
+    {
+      "regularization": 1e-05,
+      "validation": {
+        "sample_count": 1800,
+        "nmse_linear": 0.021185905845680586,
+        "nmse_db": -16.739529621387984,
+        "diagnostics": {
+          "per_query": {
+            "q0": {
+              "sample_count": 1800,
+              "nmse_linear": 0.021178603990572607,
+              "nmse_db": -16.741026702517782
+            },
+            "q3": {
+              "sample_count": 1800,
+              "nmse_linear": 0.02119320768992313,
+              "nmse_db": -16.73803305837424
+            }
+          },
+          "overall": {
+            "sample_count": 1800,
+            "nmse_linear": 0.021185905845680586,
+            "nmse_db": -16.739529621387984
+          },
+          "pilot_anchor_aggregate": {
+            "sample_count": 1800,
+            "nmse_linear": 0.021185905845680586,
+            "nmse_db": -16.739529621387984
+          },
+          "observed_anchor_aggregate": {
+            "sample_count": 1800,
+            "nmse_linear": 0.021185905845680586,
+            "nmse_db": -16.739529621387984
+          }
+        }
+      }
+    },
+    {
+      "regularization": 0.0001,
+      "validation": {
+        "sample_count": 1800,
+        "nmse_linear": 0.02118514323594152,
+        "nmse_db": -16.739685953227166,
+        "diagnostics": {
+          "per_query": {
+            "q0": {
+              "sample_count": 1800,
+              "nmse_linear": 0.021177848908636304,
+              "nmse_db": -16.74118154452929
+            },
+            "q3": {
+              "sample_count": 1800,
+              "nmse_linear": 0.021192437638916695,
+              "nmse_db": -16.738190861281485
+            }
+          },
+          "overall": {
+            "sample_count": 1800,
+            "nmse_linear": 0.02118514323594152,
+            "nmse_db": -16.739685953227166
+          },
+          "pilot_anchor_aggregate": {
+            "sample_count": 1800,
+            "nmse_linear": 0.02118514323594152,
+            "nmse_db": -16.739685953227166
+          },
+          "observed_anchor_aggregate": {
+            "sample_count": 1800,
+            "nmse_linear": 0.02118514323594152,
+            "nmse_db": -16.739685953227166
+          }
+        }
+      }
+    },
+    {
+      "regularization": 0.001,
+      "validation": {
+        "sample_count": 1800,
+        "nmse_linear": 0.021177564181853084,
+        "nmse_db": -16.741239933888185,
+        "diagnostics": {
+          "per_query": {
+            "q0": {
+              "sample_count": 1800,
+              "nmse_linear": 0.02117034517422629,
+              "nmse_db": -16.742720609206128
+            },
+            "q3": {
+              "sample_count": 1800,
+              "nmse_linear": 0.021184783299427686,
+              "nmse_db": -16.739759740677172
+            }
+          },
+          "overall": {
+            "sample_count": 1800,
+            "nmse_linear": 0.021177564181853084,
+            "nmse_db": -16.741239933888185
+          },
+          "pilot_anchor_aggregate": {
+            "sample_count": 1800,
+            "nmse_linear": 0.021177564181853084,
+            "nmse_db": -16.741239933888185
+          },
+          "observed_anchor_aggregate": {
+            "sample_count": 1800,
+            "nmse_linear": 0.021177564181853084,
+            "nmse_db": -16.741239933888185
+          }
+        }
+      }
+    }
+  ],
+  "selected_validation": {
+    "sample_count": 1800,
+    "nmse_linear": 0.021177564181853084,
+    "nmse_db": -16.741239933888185,
+    "diagnostics": {
+      "per_query": {
+        "q0": {
+          "sample_count": 1800,
+          "nmse_linear": 0.02117034517422629,
+          "nmse_db": -16.742720609206128
+        },
+        "q3": {
+          "sample_count": 1800,
+          "nmse_linear": 0.021184783299427686,
+          "nmse_db": -16.739759740677172
+        }
+      },
+      "overall": {
+        "sample_count": 1800,
+        "nmse_linear": 0.021177564181853084,
+        "nmse_db": -16.741239933888185
+      },
+      "pilot_anchor_aggregate": {
+        "sample_count": 1800,
+        "nmse_linear": 0.021177564181853084,
+        "nmse_db": -16.741239933888185
+      },
+      "observed_anchor_aggregate": {
+        "sample_count": 1800,
+        "nmse_linear": 0.021177564181853084,
+        "nmse_db": -16.741239933888185
+      }
+    }
+  },
+  "artifact": {
+    "regularization": 0.001,
+    "fit_rows": 1280000,
+    "fit_split": "train",
+    "target_blocks": [
+      0,
+      3
+    ],
+    "semantics_hash": "04c15fc90f82ab8f51cca2d486313c3728554286452e16a0e36e2a0e4385052d",
+    "coefficient_shape": [
+      64,
+      512
+    ],
+    "seed": 123,
+    "fraction": null,
+    "sample_count": 20000,
+    "sample_manifest_sha256": null,
+    "indices_hash": null,
+    "selection_split": "validation",
+    "test_split_used": false,
+    "path": "/home/zhoujunyi/projects/PriST-RIS-baseline-migration/artifacts/baselines/ridge_q0q3_full_train.npz",
+    "sha256": "34e331e9bc06231ab20b595d5390151c29934182c2cd03a368161246bc146d70"
+  },
+  "subset_provenance": {
+    "seed": 123,
+    "fraction": null,
+    "sample_count": 20000,
+    "sample_manifest_sha256": null,
+    "indices_hash": null,
+    "selection_split": "validation",
+    "test_split_used": false
+  }
+}
