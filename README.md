@@ -1,10 +1,27 @@
-# PriST-RIS V3.2
+# PriST-RIS
+
+## Paper configurations and repository status
+
+The PriST-RIS v2.9 manuscript reports two final configurations. **PriST-RIS-Full uses a Direct spatial path; PriST-RIS-Lite uses a Prior-Assisted (Ridge) spatial path.** Both use staged spatial-then-temporal training. The settings below describe the reported experiments, not the defaults of a single CLI model key.
+
+| Final configuration | Spatial path | Spatial width | Spatial blocks | Temporal width | Temporal bases | Post-core refinement |
+|---|---|---:|---|---:|---:|---|
+| PriST-RIS-Full | Direct | 80 | (3, 3, 2) | 80 | 2 | Shared 24-channel, two-block refiner |
+| PriST-RIS-Lite | Prior-Assisted | 32 | (5, 2, 1) | 24 | 2 | None |
+
+The reported Mobility experiments use 20,000 TRAIN, 1,800 VALIDATION, and 9,000 held-out TEST samples; seeds 123, 456, and 789; FP32 AdamW; 100 spatial epochs with a `5e-4` to `5e-6` cosine learning-rate schedule and batch size 32; and 30 temporal epochs at a fixed `5e-4` learning rate and batch size 16. Checkpoints are selected on VALIDATION. The manuscript reports overall TEST NMSE of **−19.951 ± 0.085 dB** for Full and **−19.347 ± 0.036 dB** for Lite (three-seed mean ± sample standard deviation; lower is better).
+
+The capacity-matched **Full-Direct / Full-Prior** spatial comparison in the manuscript studies the effect of the explicit prior across training-data fractions. Full-Prior is an analysis variant, not the final PriST-RIS-Full. A subsequent **Lite-Direct** follow-up compared the frozen paper Lite-Prior results with three newly trained Direct seeds under the Lite protocol. On held-out TEST, the paired `Direct − Prior` NMSE difference is **+0.387 ± 0.038 dB** (mean ± sample standard deviation); positive values favor Prior. Lite-Prior was not retrained for this follow-up, which is not part of the v2.9 manuscript tables.
+
+The V3.2 implementation and historical screening workflows were present at [commit `93a89da`](https://github.com/zhoujun1zzz/PriST-RIS/commit/93a89da21cb8014392bd892f1fde2a66ce930225). In particular, the legacy `prist_ris_full` model-key default uses a Ridge prior and **does not identify the paper's final Direct Full configuration**. The Lite V1 screening and Temporal-Lite V1 sections below describe earlier candidates, not the final `(5, 2, 1)` Lite spatial configuration. The exact final-run launchers, frozen manifests, and checkpoints are not yet assembled into a complete paper-reproduction release here. The commands below document development workflows; they do not by themselves reproduce the reported TEST results.
+
+## V3.2 implementation history
 
 PriST-RIS is a standalone PyTorch project for prior-guided spatio-temporal RIS channel reconstruction. Architecture version **3.2** repairs the spatial learning path while retaining the validated physical grid and Mobility q0/q3 data semantics.
 
 V3.0 evidence remains reproducible at commit `f10c90ecd1f3bb4d3764e9aa709db9843be0f995`; legacy runs and checkpoints are not overwritten. Current checkpoints carry `architecture_version="3.2"`, `spatial_protocol_version="physical_stable_residual_position_v3"`, and `position_semantics_version="physical_ris_decoupled_v1"`. Mobility retains `mobility_contract_version="mobility_q0_q3_v1"` and its existing semantics hash, so post-fix q0/q3 Ridge artifacts remain reusable. Older model checkpoints without the decoupled position contract are rejected.
 
-## Canonical model ladder
+## Historical V3.2 model-key ladder
 
 | Key | Physical grid | Ridge prior | Legacy default position bundle | Observed→dense attention | Trend temporal |
 |---|---:|---:|---:|---:|---:|
@@ -13,7 +30,7 @@ V3.0 evidence remains reproducible at commit `f10c90ecd1f3bb4d3764e9aa709db9843b
 | `prist_ris_c` | yes | yes | yes | yes | no |
 | `prist_ris_full` | yes | yes | yes | yes | yes |
 
-C/Full retain their historical coupled default for reproducibility, but new experiments use six explicit switches that independently control backbone RIS coordinates, backbone antenna-index encoding, attention enablement, attention RIS coordinates, and attention antenna-index encoding. The old `coordinate_enabled` option is only a recorded compatibility alias. Antennas are never flattened into one global attention sequence. Mobility A/B/C return compact q0/q3 anchors; Full returns strict q0..q5 order.
+The V3.2 C/Full presets retain their historical coupled default for reproducibility, but new experiments use six explicit switches that independently control backbone RIS coordinates, backbone antenna-index encoding, attention enablement, attention RIS coordinates, and attention antenna-index encoding. The old `coordinate_enabled` option is only a recorded compatibility alias. Antennas are never flattened into one global attention sequence. Mobility A/B/C return compact q0/q3 anchors; the legacy Full key returns strict q0..q5 order.
 
 ## Frozen data and metric
 
@@ -32,7 +49,7 @@ python -m pip install -e ".[dev]"
 pytest -q
 ```
 
-## Validation-only development
+## Historical validation-only development example
 
 ```bash
 export PRIST_RIS_DATA_ROOT=/root/autodl-tmp/lpan
@@ -121,7 +138,7 @@ Both runners execute candidates serially for exactly 30 epochs. A candidate exte
 
 See [the unified screening protocol](docs/unified_module_screening.md) and [the GPU3 serial launcher](scripts/run_unified_screening_gpu3.sh) for exact execution commands.
 
-## Paper experiment matrix
+## Historical validation-only paper experiment matrix
 
 The validation-only paper framework generates deterministic data-efficiency and low-shot transfer plans without starting training:
 
@@ -132,7 +149,7 @@ prist-ris paper-matrix --action plan --phase transfer --seeds 123
 
 It binds Direct/Prior models to identical nested TRAIN subsets, fits each Ridge baseline from the same allowed fraction, records resumable cosine timing, and produces paper-ready JSON/CSV summaries. Formal execution remains an explicit later action and TEST stays locked. See [the paper experiment matrix protocol](docs/paper_experiment_matrix.md).
 
-## PriST-RIS-Lite V1 screening
+## Historical PriST-RIS-Lite V1 screening
 
 The Lite workflow is a fixed two-candidate spatial compression check, not a new
 architecture search. It leaves the frozen S3 and paper-matrix configurations
@@ -162,7 +179,7 @@ Summaries report both candidates and Pareto dominance but never choose a winner.
 No Lite command opens TEST or modifies Temporal T2. See
 [the Lite V1 protocol](docs/lite_screening_v1.md).
 
-## PriST-RIS Temporal-Lite V1
+## Historical PriST-RIS Temporal-Lite V1
 
 Temporal-Lite is a single predeclared TL24 compression check built on the
 full-data prior-guided Lite-A spatial model. Spatial width remains 32 while the
